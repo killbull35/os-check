@@ -345,7 +345,13 @@ FILTER_TEMP=""
 FILTER_ZONE=""
 FORCE_REFRESH=""
 RESUME=""
-LOG_DIR="/tmp/os_diag_$(date '+%Y%m%d_%H%M%S')"
+# Build a suffix that reflects filter parameters for reproducible logs
+FILTER_SUFFIX=""
+[[ -n "$FILTER_TEMP" ]] && FILTER_SUFFIX+="_temp-${FILTER_TEMP}"
+[[ -n "$FILTER_ZONE" ]] && FILTER_SUFFIX+="_zone-${FILTER_ZONE}"
+# Use a generic suffix when no filter is supplied
+[[ -z "$FILTER_SUFFIX" ]] && FILTER_SUFFIX="_all"
+LOG_DIR="/tmp/os_diag${FILTER_SUFFIX}_$(date '+%Y%m%d_%H%M%S')"
 CACHE_TTL=300         # secondes avant re-fetch (5 min)
 # AUTH="-u admin:motdepasse"
 # CURL_OPTS="-k"      # si TLS auto-signe
@@ -679,33 +685,55 @@ if [ "$LAST_CHECKPOINT" = "SHARDS_DONE" ]; then
             on_target[key] = on_target[key] entry "\n"
         }
 
-        # Shards non STARTED sur noeuds cibles (RELOCATING, INITIALIZING, UNASSIGNED)
-        $4 != "STARTED" && ($6 in targets) {
-            key = $1 "|" $2
-            entry = $1 "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7 "|" $8
-            not_started[key] = not_started[key] entry "\n"
-        }
+    # Shards non STARTED sur noeuds cibles (INITIALIZING, UNASSIGNED)
+    $4 == "INITIALIZING" && ($6 in targets) {
+        key = $1 "|" $2
+        entry = $1 "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7 "|" $8
+        replicating[key] = replicating[key] entry "\n"
+    }
+    $4 == "UNASSIGNED" && ($6 in targets) {
+        key = $1 "|" $2
+        entry = $1 "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7 "|" $8
+        not_started[key] = not_started[key] entry "\n"
+    }
+    # RELOCATING shards are already on target node and are considered safe (they already have data)
+    $4 == "RELOCATING" && ($6 in targets) {
+        key = $1 "|" $2
+        entry = $1 "|" $2 "|" $3 "|" $4 "|" $5 "|" $6 "|" $7 "|" $8
+        on_target[key] = on_target[key] entry "\n"
+    }
 
-        END {
-            # Shards sur noeuds cibles
-            for (key in on_target) {
-                n = split(on_target[key], lines, "\n")
-                for (i = 1; i < n; i++) {
-                    if (lines[i] == "") continue
-                    tag = (copies[key] == 1) ? "RISK" : "SAFE"
-                    print tag "|" copies[key] "|" lines[i]
-                }
-            }
-            # Shards non demarres sur noeuds cibles
-            for (key in not_started) {
-                n = split(not_started[key], lines, "\n")
-                for (i = 1; i < n; i++) {
-                    if (lines[i] == "") continue
-                    tag = (copies[key] <= 1) ? "RISK" : "WARN"
-                    print tag "|" copies[key] "|" lines[i]
-                }
+    END {
+        # Shards on target nodes (STARTED and RELOCATING are safe)
+        for (key in on_target) {
+            n = split(on_target[key], lines, "\n")
+            for (i = 1; i < n; i++) {
+                if (lines[i] == "") continue
+                tag = (copies[key] == 1) ? "RISK" : "SAFE"
+                print tag "|" copies[key] "|" lines[i]
             }
         }
+        # Replicating shards (INITIALIZING) – separate tag
+        for (key in replicating) {
+            n = split(replicating[key], lines, "\n")
+            for (i = 1; i < n; i++) {
+                if (lines[i] == "") continue
+                tag = (copies[key] <= 1) ? "RISK" : "REPLICATING"
+                print tag "|" copies[key] "|" lines[i]
+            }
+    }
+    # Shards non demarres sur noeuds cibles (UNASSIGNED)
+    for (key in not_started) {
+        n = split(not_started[key], lines, "\n")
+        for (i = 1; i < n; i++) {
+            if (lines[i] == "") continue
+            tag = (copies[key] <= 1) ? "RISK" : "WARN"
+            print tag "|" copies[key] "|" lines[i]
+        }
+    }
+}
+        }
+    }
     ' "$TARGET_NODES_FILE" "$CACHE_SHARDS" > "$RISK_FILE"
 
     # Stats par noeud cible
@@ -737,6 +765,7 @@ fi
 RISK_COUNT=$(grep -c "^RISK|" "$RISK_FILE" 2>/dev/null || echo 0)
 WARN_COUNT=$(grep -c "^WARN|" "$RISK_FILE" 2>/dev/null || echo 0)
 SAFE_COUNT=$(grep -c "^SAFE|" "$RISK_FILE" 2>/dev/null || echo 0)
+REPLICATING_COUNT=$(grep -c "^REPLICATING|" "$RISK_FILE" 2>/dev/null || echo 0)
 
 # --- LOG : shards a risque (copie unique) ---
 section "$LOG_RISK" "SHARDS A RISQUE - Copie unique (perte de donnees possible)"
@@ -745,7 +774,7 @@ section "$LOG_RISK" "SHARDS A RISQUE - Copie unique (perte de donnees possible)"
     echo "  INDEX       : nom de l index"
     echo "  SHARD       : numero du shard"
     echo "  ROLE        : p=primaire r=replica"
-    echo "  ETAT        : etat actuel du shard (STARTED / RELOCATING / UNASSIGNED...)"
+    echo "  ETAT        : etat actuel du shard (STARTED / INITIALIZING / UNASSIGNED...). RELOCATING shards are considered safe and are not listed here."
     echo "  COPIES      : nombre de copies STARTED dans le cluster"
     echo "  NOEUD       : noeud hebergeant le shard"
     echo "  IP          : adresse IP du noeud"
@@ -788,6 +817,20 @@ else
             printf "%-45s %-18s %.2f GB\n", i, count[i], size[i]/1024/1024/1024
     }' | sort -t'|' -k2 -rn | tee -a "$LOG_RISK" >> "$LOG_MAIN"
 fi
+
+# --- LOG : shards REPLICATING (INITIALIZING) ---
+section "$LOG_RISK" "SHARDS EN REPLICATION - Initializing (données en cours de réplication)"
+{
+    printf "%s\n" "Ces shards sont en état INITIALIZING ; la réplication n'est pas encore terminée."
+    printf "%45s %7s %5s %13s %7s %25s %16s %12s %s\n" \
+        "INDEX" "SHARD" "ROLE" "ETAT" "COPIES" "NOEUD" "IP" "TAILLE" "SEGMENTS"
+    printf '%s\n' "$(printf '%0.s-' {1..150})"
+}
+
+grep "^REPLICATING|^RISK" "$RISK_FILE" | awk -F'|' '{
+    size_gb = sprintf("%.2f GB", $7/1024/1024/1024)
+    printf "%45s %7s %5s %13s %7s %25s %16s %12s %s\n", $3,$4,$5,$6,$2,$8,$9,size_gb,$10
+}' | tee -a "$LOG_RISK" >> "$LOG_MAIN"
 
 # Shards WARN (non STARTED sur noeuds cibles)
 if [ "$WARN_COUNT" -gt 0 ]; then
@@ -835,6 +878,7 @@ section "$LOG_NODE_STATS" "REPARTITION PAR NOEUD CIBLE"
     echo "RESULTATS"
     echo "---------"
     echo "Shards a risque (copie unique) : $RISK_COUNT  ← DANGER si maintenance"
+    echo "Shards en cours de réplication (INITIALIZING) : $REPLICATING_COUNT"
     echo "Shards non STARTED sur cibles  : $WARN_COUNT"
     echo "Shards OK (replicas ailleurs)  : $SAFE_COUNT"
     echo ""
@@ -874,6 +918,12 @@ echo ""
 printf "  %-25s %s\n" "diagnostic.log"  "-> execution complete"
 printf "  %-25s %s\n" "nodes.log"       "-> noeuds decouverts / filtres"
 printf "  %-25s %s (%s lignes)" "risk_shards.log" "-> shards DANGER" "$RISK_COUNT"
+# show replicating count if present
+if [ "$REPLICATING_COUNT" -gt 0 ]; then
+    printf "  %-25s %s (%s lignes)" "risk_shards.log" "-> shards EN REPLICATION" "$REPLICATING_COUNT"
+    echo ""
+fi
+
 echo ""
 printf "  %-25s %s (%s lignes)" "safe_shards.log" "-> shards OK" "$SAFE_COUNT"
 echo ""
@@ -884,6 +934,10 @@ echo ""
 if [ "$RISK_COUNT" -gt 0 ]; then
     echo "  🔴 $RISK_COUNT shard(s) en copie unique — maintenance BLOQUEE"
     echo "     Voir : $LOG_RISK"
+    if [ "$REPLICATING_COUNT" -gt 0 ]; then
+        echo "  🔄 $REPLICATING_COUNT shard(s) en cours de réplication (INITIALIZING)"
+        echo "     Voir : $LOG_RISK"
+    fi
 else
     echo "  ✅ Aucun shard a risque — maintenance possible"
 fi
