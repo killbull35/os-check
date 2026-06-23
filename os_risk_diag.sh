@@ -884,9 +884,11 @@ else
             | awk '
                 /"in_sync_allocations"/ { in_block=1; next }
                 in_block && /"[0-9]+"/ {
-                    # Extraire le numero de shard
-                    match($0, /"([0-9]+)"/, arr)
-                    shard_num = arr[1]
+                    # Extraire le numero de shard — POSIX : gsub pour isoler la valeur
+                    tmp = $0
+                    gsub(/^[^"]*"/, "", tmp)   # supprimer tout avant le premier "
+                    gsub(/".*$/,    "", tmp)   # supprimer tout apres le chiffre
+                    shard_num = tmp
                     # Extraire tous les IDs entre crochets
                     gsub(/.*\[/, ""); gsub(/\].*/, "")
                     gsub(/"/, ""); gsub(/ /, "")
@@ -910,17 +912,21 @@ else
             | tr '{' '\n' | tr '}' '\n' \
             | awk '
                 /"shard"/ {
-                    match($0, /"shard" *: *([0-9]+)/, a); shard_num = a[1]
+                    tmp = $0; gsub(/.*"shard" *: */, "", tmp); gsub(/[^0-9].*/, "", tmp)
+                    shard_num = tmp
                     node = "NONE"; alloc_id = "NONE"; state = ""
                 }
                 /"state"/ && /"UNASSIGNED"/ { state = "UNASSIGNED" }
                 /"node"/ {
-                    match($0, /"node" *: *"([^"]+)"/, a); node = a[1]
+                    tmp = $0
+                    gsub(/.*"node" *: *"/, "", tmp); gsub(/".*/, "", tmp)
+                    if (tmp != "") node = tmp
                 }
                 /"allocation_id"/ {
-                    # allocation_id peut etre sur la ligne suivante
-                    match($0, /"id" *: *"([^"]+)"/, a)
-                    if (a[1] != "") alloc_id = a[1]
+                    # allocation_id est sur la ligne ou la suivante sous "id"
+                    tmp = $0
+                    gsub(/.*"id" *: *"/, "", tmp); gsub(/".*/, "", tmp)
+                    if (tmp != "" && tmp != $0) alloc_id = tmp
                 }
                 /"primary" *: *true/ && state == "UNASSIGNED" {
                     print shard_num "|" node "|" alloc_id
