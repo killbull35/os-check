@@ -33,7 +33,6 @@ CACHE_TTL=300         # secondes avant re-fetch (5 min)
 
 # ------------------------------------------------------------------------------
 # Parsing des arguments
-# ------------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --temp)      FILTER_TEMP="$2";     shift 2 ;;
@@ -44,6 +43,8 @@ while [[ $# -gt 0 ]]; do
         *) OS_HOST="$1"; shift ;;
     esac
 done
+
+# Valeur par défaut du parallélisme si non fournie
 
 # ------------------------------------------------------------------------------
 # Construction du nom de dossier avec les parametres du run
@@ -373,75 +374,60 @@ if [ "$LAST_CHECKPOINT" = "SHARDS_DONE" ]; then
     #   TAG | COPIES_STARTED | COPIES_INITIALIZING | index | shard | prirep |
     #   state | store | node | ip | segments
     # -------------------------------------------------------------------------
-    awk '
-        # --- Chargement des noeuds cibles ---
-        NR==FNR {
-            targets[$1] = 1
-            next
-        }
-
-        # --- Comptage global par (index|shard) ---
+    # ---------------------------------------------------------------------
+    # Première passe : compter les copies STARTED et INITIALIZING par (index|shard)
+    # ---------------------------------------------------------------------
+    awk -v targets_file="$TARGET_NODES_FILE" '
+        NR==FNR {targets[$1]=1; next}
         {
-            key = $1 "|" $2
-            state = $4
-
-            if (state == "STARTED")      copies_started[key]++
-            if (state == "INITIALIZING") copies_init[key]++
-
-            # Stocker toutes les lignes par cle pour la passe END
-            all_lines[key] = all_lines[key] $0 "\n"
-
-            # Marquer si ce shard a au moins une copie sur un noeud cible
-            if ($6 in targets) has_target[key] = 1
+            key=$1"|"$2
+            if ($4=="STARTED")      copies_started[key]++
+            if ($4=="INITIALIZING") copies_init[key]++
         }
-
         END {
-            for (key in has_target) {
-                n = split(all_lines[key], lines, "\n")
-                started  = copies_started[key] + 0
-                init     = copies_init[key]    + 0
+            for (k in copies_started) print k"|"copies_started[k] > "/tmp/shard_started.$"
+            for (k in copies_init)    print k"|"copies_init[k]    > "/tmp/shard_init.$"
+        }
+    ' "$TARGET_NODES_FILE" "$CACHE_SHARDS"
 
-                for (i = 1; i < n; i++) {
-                    if (lines[i] == "") continue
-
-                    # Re-parser la ligne
-                    nf = split(lines[i], f, " ")
-                    idx    = f[1]; shard = f[2]; role  = f[3]
-                    state  = f[4]; store = f[5]; node  = f[6]
-                    ip     = f[7]; segs  = f[8]
-
-                    # Ligne de base du output
-                    base = idx "|" shard "|" role "|" state "|" store "|" node "|" ip "|" segs
-
-                    # Shard sur noeud cible
-                    if (node in targets) {
-                        if (state == "STARTED") {
-                            tag = (started == 1) ? "RISK" : "SAFE"
-                            print tag "|" started "|" init "|" base
-                        } else if (state == "INITIALIZING") {
-                            # Replication en cours sur le noeud cible lui-meme
-                            print "REPLICATING|" started "|" init "|" base
-                        } else {
-                            # RELOCATING ou autre etat non nominal
-                            tag = (started <= 1) ? "RISK" : "SAFE"
-                            print tag "|" started "|" init "|" base
-                        }
-                    } else {
-                        # Shard hors noeud cible mais appartient a un index
-                        # dont au moins un shard est sur noeud cible
-                        if (state == "INITIALIZING") {
-                            # Replica en cours de copie depuis le primaire sur noeud cible
-                            print "REPLICATING|" started "|" init "|" base
-                        } else if (state == "UNASSIGNED") {
-                            # Pas de noeud, pas encore en cours
-                            print "UNASSIGNED|" started "|" init "|" base
-                        }
-                        # STARTED hors cible : on les ignore (ils sont la copie survivante)
-                    }
+    # ---------------------------------------------------------------------
+    # Deuxième passe : appliquer la logique de classification en utilisant les comptes calculés
+    # ---------------------------------------------------------------------
+    awk -v targets_file="$TARGET_NODES_FILE" -v started_file="/tmp/shard_started.$" -v init_file="/tmp/shard_init.$" '
+        BEGIN {
+            while ((getline line < targets_file) > 0) targets[line]=1
+            while ((getline line < started_file) > 0) { split(line, a, "|"); started[a[1]"|"a[2]]=a[2] }
+            while ((getline line < init_file) > 0)    { split(line, a, "|"); init[a[1]"|"a[2]]=a[2] }
+        }
+        {
+            key=$1"|"$2
+            # assure existence de compteurs
+            if (!(key in started)) started[key]=0
+            if (!(key in init))    init[key]=0
+            # déterminer si le shard a une copie sur un noeud cible
+            has_target=($6 in targets)
+            if (has_target) {
+                if ($4=="STARTED") {
+                    tag = (started[key]==1) ? "RISK" : "SAFE"
+                    print tag "|" started[key] "|" init[key] "|" $0
+                } else if ($4=="INITIALIZING") {
+                    print "REPLICATING|" started[key] "|" init[key] "|" $0
+                } else {
+                    tag = (started[key]<=1) ? "RISK" : "SAFE"
+                    print tag "|" started[key] "|" init[key] "|" $0
                 }
+            } else {
+                if ($4=="INITIALIZING") {
+                    print "REPLICATING|" started[key] "|" init[key] "|" $0
+                } else if ($4=="UNASSIGNED") {
+                    print "UNASSIGNED|" started[key] "|" init[key] "|" $0
+                }
+                # STARTED hors cible ignoré
             }
         }
-    ' "$TARGET_NODES_FILE" "$CACHE_SHARDS" > "$RISK_FILE"
+    ' "$CACHE_SHARDS" > "$RISK_FILE"
+    # Nettoyage des fichiers temporaires de comptage
+    rm -f /tmp/shard_started.$ /tmp/shard_init.$
 
     # --- Stats par noeud cible ---
     awk '
@@ -515,10 +501,26 @@ fi
 # ------------------------------------------------------------------------------
 # COMPTAGES PAR CATEGORIE
 # ------------------------------------------------------------------------------
-RISK_COUNT=$(grep -c "^RISK|"        "$RISK_FILE" 2>/dev/null || echo 0)
-SAFE_COUNT=$(grep -c "^SAFE|"        "$RISK_FILE" 2>/dev/null || echo 0)
-REPLIC_COUNT=$(grep -c "^REPLICATING|" "$RISK_FILE" 2>/dev/null || echo 0)
-UNASSIGNED_COUNT=$(grep -c "^UNASSIGNED|" "$RISK_FILE" 2>/dev/null || echo 0)
+# Comptage des catégories en une passe unique
+awk '
+    BEGIN {risk=safe=replic=unassigned=0}
+    {
+        if ($1=="RISK")       risk++
+        else if ($1=="SAFE")  safe++
+        else if ($1=="REPLICATING") replic++
+        else if ($1=="UNASSIGNED")  unassigned++
+    }
+    END {
+        print risk > "/tmp/risk_cnt"
+        print safe > "/tmp/safe_cnt"
+        print replic > "/tmp/replic_cnt"
+        print unassigned > "/tmp/unassigned_cnt"
+    }
+' "$RISK_FILE"
+RISK_COUNT=$(cat /tmp/risk_cnt)
+SAFE_COUNT=$(cat /tmp/safe_cnt)
+REPLIC_COUNT=$(cat /tmp/replic_cnt)
+UNASSIGNED_COUNT=$(cat /tmp/unassigned_cnt)
 
 # Entete commun des tableaux de shards
 SHARD_HEADER='%-45s %-7s %-5s %-13s %-8s %-8s %-25s %-16s %s'
@@ -834,208 +836,282 @@ else
     mkdir -p "$CACHE_STATE_DIR"
 
     # ------------------------------------------------------------------
-    # PHASE A : Fetch du cluster state par index (une seule fois par index)
-    # Source de verite pour in_sync_allocations et allocation_id par shard
+    # PHASE A : UN SEUL appel HTTP pour TOUS les index concernes
     #
-    # Structure extraite depuis :
-    #   GET /_cluster/state/metadata/{index}
+    # On construit la liste CSV des index UNASSIGNED et on interroge
+    # le cluster state en une seule requete :
+    #   GET /_cluster/state/metadata,routing_table/idx1,idx2,...
     #
-    # On construit un fichier plat par index :
-    #   shard_num|alloc_id_1,alloc_id_2,...   (in_sync_allocations)
+    # Puis UN SEUL awk parse le JSON et produit deux fichiers plats :
+    #   insync_flat.txt  : index|shard|id1,id2,...
+    #   routing_flat.txt : index|shard|allocation_id
     #
-    # Et depuis routing_table :
-    #   GET /_cluster/state/routing_table/{index}
-    # On extrait pour chaque shard UNASSIGNED son allocation_id connu
-    #   shard_num|node_id|allocation_id
+    # Aucune boucle shell, aucun fork supplementaire.
     # ------------------------------------------------------------------
 
-    # Collecter les index uniques a traiter
-    INDEXES_TO_FETCH=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
-        | awk -F'|' '{print $4}' | sort -u)
+    CACHE_STATE_DIR="$CACHE_DIR/cluster_state"
+    mkdir -p "$CACHE_STATE_DIR"
 
-    INDEX_COUNT=$(echo "$INDEXES_TO_FETCH" | wc -l | tr -d ' ')
-    log "Fetch cluster state pour $INDEX_COUNT index uniques"
+    CACHE_STATE_ALL="$CACHE_STATE_DIR/all_indexes.json"
+    CACHE_INSYNC="$CACHE_STATE_DIR/insync_flat.txt"
+    CACHE_ROUTING="$CACHE_STATE_DIR/routing_flat.txt"
 
-    for idx in $INDEXES_TO_FETCH; do
-        # Fichier cache par index — in_sync : "shard|id1,id2,..."
-        INSYNC_CACHE="$CACHE_STATE_DIR/${idx}.insync"
-        # Fichier cache par index — routing : "shard|node|alloc_id"
-        ROUTING_CACHE="$CACHE_STATE_DIR/${idx}.routing"
+    # Liste CSV des index uniques ayant des shards UNASSIGNED
+    INDEX_CSV=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
+        | awk -F'|' '{print $4}' | sort -u | tr '\n' ',' | sed 's/,$//')
 
-        if cache_valid "$INSYNC_CACHE" && cache_valid "$ROUTING_CACHE"; then
-            continue
+    INDEX_COUNT=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
+        | awk -F'|' '{print $4}' | sort -u | wc -l | tr -d ' ')
+
+    log "Fetch cluster state (metadata+routing_table) — $INDEX_COUNT index en un seul appel"
+
+    if ! cache_valid "$CACHE_STATE_ALL"; then
+        HTTP_CODE=$(${CURL}_cluster/state/metadata,routing_table/${INDEX_CSV}?pretty \
+            -w "%{http_code}" -o "$CACHE_STATE_ALL" 2>/dev/null)
+        if [ "$HTTP_CODE" != "200" ] || [ ! -s "$CACHE_STATE_ALL" ]; then
+            log_warn "Fetch filtre echoue (HTTP $HTTP_CODE) — fallback sans filtre index"
+            HTTP_CODE=$(${CURL}_cluster/state/metadata,routing_table?pretty \
+                -w "%{http_code}" -o "$CACHE_STATE_ALL" 2>/dev/null)
         fi
-
-        # Fetch metadata (in_sync_allocations)
-        META_JSON=$(${CURL}_cluster/state/metadata/${idx}?pretty 2>/dev/null)
-
-        if [ -z "$META_JSON" ]; then
-            log_warn "cluster state metadata non disponible pour $idx"
-            touch "$INSYNC_CACHE" "$ROUTING_CACHE"
-            continue
-        fi
-
-        # Parser in_sync_allocations depuis le JSON shell pur
-        # Format attendu :
-        #   "in_sync_allocations": { "0": ["id1","id2"], "1": ["id3"] }
-        # On produit : shard_num|id1,id2,...
-        echo "$META_JSON" \
-            | tr '{' '\n' | tr '}' '\n' \
-            | awk '
-                /"in_sync_allocations"/ { in_block=1; next }
-                in_block && /"[0-9]+"/ {
-                    # Extraire le numero de shard — POSIX : gsub pour isoler la valeur
-                    tmp = $0
-                    gsub(/^[^"]*"/, "", tmp)   # supprimer tout avant le premier "
-                    gsub(/".*$/,    "", tmp)   # supprimer tout apres le chiffre
-                    shard_num = tmp
-                    # Extraire tous les IDs entre crochets
-                    gsub(/.*\[/, ""); gsub(/\].*/, "")
-                    gsub(/"/, ""); gsub(/ /, "")
-                    print shard_num "|" $0
-                }
-                in_block && /^\s*\}/ { in_block=0 }
-            ' > "$INSYNC_CACHE"
-
-        # Fetch routing_table (allocation_id par shard)
-        ROUTE_JSON=$(${CURL}_cluster/state/routing_table/${idx}?pretty 2>/dev/null)
-
-        if [ -z "$ROUTE_JSON" ]; then
-            log_warn "cluster state routing_table non disponible pour $idx"
-            touch "$ROUTING_CACHE"
-            continue
-        fi
-
-        # Parser routing_table — on cherche les shards UNASSIGNED avec un allocation_id
-        # Format produit : shard_num|node (ou NONE)|allocation_id (ou NONE)
-        echo "$ROUTE_JSON" \
-            | tr '{' '\n' | tr '}' '\n' \
-            | awk '
-                /"shard"/ {
-                    tmp = $0; gsub(/.*"shard" *: */, "", tmp); gsub(/[^0-9].*/, "", tmp)
-                    shard_num = tmp
-                    node = "NONE"; alloc_id = "NONE"; state = ""
-                }
-                /"state"/ && /"UNASSIGNED"/ { state = "UNASSIGNED" }
-                /"node"/ {
-                    tmp = $0
-                    gsub(/.*"node" *: *"/, "", tmp); gsub(/".*/, "", tmp)
-                    if (tmp != "") node = tmp
-                }
-                /"allocation_id"/ {
-                    # allocation_id est sur la ligne ou la suivante sous "id"
-                    tmp = $0
-                    gsub(/.*"id" *: *"/, "", tmp); gsub(/".*/, "", tmp)
-                    if (tmp != "" && tmp != $0) alloc_id = tmp
-                }
-                /"primary" *: *true/ && state == "UNASSIGNED" {
-                    print shard_num "|" node "|" alloc_id
-                }
-            ' > "$ROUTING_CACHE"
-
-    done
-    log_ok "Cluster state fetche pour tous les index concernes"
-
-    # ------------------------------------------------------------------
-    # PHASE B : Classification shard par shard
-    # Croisement allocation_id (routing_table) vs in_sync_allocations
-    #
-    # Logique :
-    #   1. Recuperer allocation_id du shard depuis routing_table
-    #   2. Verifier si cet id est dans la liste in_sync du shard
-    #      OUI  → le noeud absent avait une copie valide → ATTENTE_NOEUD
-    #      NON  → copie presente mais perimee            → STALE
-    #      NONE → aucun id connu dans les metadonnees    → PERDU
-    # ------------------------------------------------------------------
-
-    while IFS='|' read -r tag started init idx shard role state store node ip; do
-        [ -z "$idx" ] && continue
-
-        SIZE_GB=$(awk -v s="$store" 'BEGIN {printf "%.2f", (s+0)/1024/1024/1024}')
-
-        INSYNC_CACHE="$CACHE_STATE_DIR/${idx}.insync"
-        ROUTING_CACHE="$CACHE_STATE_DIR/${idx}.routing"
-
-        # Recuperer l allocation_id du shard depuis routing_table
-        ALLOC_ID=$(grep "^${shard}|" "$ROUTING_CACHE" 2>/dev/null \
-            | head -1 | awk -F'|' '{print $3}')
-
-        if [ -z "$ALLOC_ID" ] || [ "$ALLOC_ID" = "NONE" ]; then
-            # Aucun allocation_id dans les metadonnees de routage → perte totale
-            CLASSIF="PERDU"
-            COUNT_PERDU=$((COUNT_PERDU + 1))
-            DETAIL="Aucun allocation_id dans le routing_table"
-            printf "%-45s %-7s %-5s %-16s %-10s %s\n" \
-                "$idx" "$shard" "$role" "🔴 PERDU" "${SIZE_GB}GB" "$DETAIL" \
-                >> "$LOG_UNRECOVERABLE"
-            {
-                echo "# INDEX: $idx | SHARD: $shard | TAILLE: ${SIZE_GB}GB | PERTE TOTALE"
-                printf 'curl -ku admin:admin -X POST "http://%s/_cluster/reroute" \\\n' "$OS_HOST"
-                printf '  -H "Content-Type: application/json" \\\n'
-                printf "  -d '{\"commands\":[{\"allocate_empty_primary\":{\"index\":\"%s\",\"shard\":%s,\"node\":\"NOEUD_CIBLE\",\"accept_data_loss\":true}}]}'\n" \
-                    "$idx" "$shard"
-                echo ""
-            } >> "$LOG_REMEDIATION"
-            continue
-        fi
-
-        # Verifier si cet allocation_id est dans la liste in_sync du shard
-        # INSYNC_CACHE contient : shard_num|id1,id2,...
-        INSYNC_IDS=$(grep "^${shard}|" "$INSYNC_CACHE" 2>/dev/null \
-            | head -1 | awk -F'|' '{print $2}')
-
-        if [ -z "$INSYNC_IDS" ]; then
-            # Shard absent des in_sync_allocations → aucune copie valide connue
-            CLASSIF="PERDU"
-            COUNT_PERDU=$((COUNT_PERDU + 1))
-            DETAIL="Shard absent de in_sync_allocations"
-            printf "%-45s %-7s %-5s %-16s %-10s %s\n" \
-                "$idx" "$shard" "$role" "🔴 PERDU" "${SIZE_GB}GB" "$DETAIL" \
-                >> "$LOG_UNRECOVERABLE"
-            {
-                echo "# INDEX: $idx | SHARD: $shard | TAILLE: ${SIZE_GB}GB | PERTE TOTALE"
-                printf 'curl -ku admin:admin -X POST "http://%s/_cluster/reroute" \\\n' "$OS_HOST"
-                printf '  -H "Content-Type: application/json" \\\n'
-                printf "  -d '{\"commands\":[{\"allocate_empty_primary\":{\"index\":\"%s\",\"shard\":%s,\"node\":\"NOEUD_CIBLE\",\"accept_data_loss\":true}}]}'\n" \
-                    "$idx" "$shard"
-                echo ""
-            } >> "$LOG_REMEDIATION"
-            continue
-        fi
-
-        # Chercher si l'allocation_id du shard figure dans in_sync
-        # (la liste peut contenir plusieurs ids separes par virgule)
-        IS_IN_SYNC=$(echo "$INSYNC_IDS" | tr ',' '\n' \
-            | grep -c "^${ALLOC_ID}$" 2>/dev/null || echo 0)
-
-        if [ "$IS_IN_SYNC" -gt 0 ]; then
-            # allocation_id trouve dans in_sync_allocations → copie valide sur noeud absent
-            CLASSIF="ATTENTE_NOEUD"
-            COUNT_ATTENTE=$((COUNT_ATTENTE + 1))
-            DETAIL="alloc_id in_sync — recovery auto au retour du noeud"
-            printf "%-45s %-7s %-5s %-16s %-10s %s\n" \
-                "$idx" "$shard" "$role" "✅ ATTENTE" "${SIZE_GB}GB" "$DETAIL" \
-                >> "$LOG_UNRECOVERABLE"
+        if [ "$HTTP_CODE" != "200" ] || [ ! -s "$CACHE_STATE_ALL" ]; then
+            log_err "Fetch cluster state impossible — etape 5 ignoree"
+            COUNT_ATTENTE=0; COUNT_STALE=0; COUNT_PERDU=0
         else
-            # allocation_id connu mais absent de in_sync → copie perimee
-            CLASSIF="STALE"
-            COUNT_STALE=$((COUNT_STALE + 1))
-            DETAIL="alloc_id hors in_sync_allocations (id=$ALLOC_ID)"
-            printf "%-45s %-7s %-5s %-16s %-10s %s\n" \
-                "$idx" "$shard" "$role" "⚠️  STALE" "${SIZE_GB}GB" "$DETAIL" \
-                >> "$LOG_UNRECOVERABLE"
-            {
-                echo "# INDEX: $idx | SHARD: $shard | TAILLE: ${SIZE_GB}GB | PERTE PARTIELLE POSSIBLE"
-                echo "# allocation_id=$ALLOC_ID hors in_sync=$INSYNC_IDS"
-                printf 'curl -ku admin:admin -X POST "http://%s/_cluster/reroute" \\\n' "$OS_HOST"
-                printf '  -H "Content-Type: application/json" \\\n'
-                printf "  -d '{\"commands\":[{\"allocate_stale_primary\":{\"index\":\"%s\",\"shard\":%s,\"node\":\"NOEUD_CIBLE\",\"accept_data_loss\":true}}]}'\n" \
-                    "$idx" "$shard"
-                echo ""
-            } >> "$LOG_REMEDIATION"
+            log_ok "Cluster state fetche ($(wc -c < "$CACHE_STATE_ALL" | tr -d ' ') bytes)"
         fi
+    else
+        log "Cache cluster state valide"
+    fi
 
-    done <<< "$UNASSIGNED_FROM_ANALYSIS"
+    # ------------------------------------------------------------------
+    # UN SEUL awk sur le JSON brut — construit insync_flat et routing_flat
+    # en une passe, sans tr/sed/grep supplementaires.
+    #
+    # Strategie de parsing POSIX (sans match a 3 args) :
+    #   - gsub pour isoler les valeurs
+    #   - variables d etat pour suivre le contexte JSON
+    #
+    # insync_flat.txt  : index|shard|id1,id2,...
+    # routing_flat.txt : index|shard|allocation_id
+    # ------------------------------------------------------------------
+
+    if [ -s "$CACHE_STATE_ALL" ] && \
+       { ! cache_valid "$CACHE_INSYNC" || ! cache_valid "$CACHE_ROUTING"; }; then
+
+        log "Parsing cluster state (un seul awk POSIX)..."
+
+        awk '
+            # ---- Detection du contexte index ----
+            # Dans metadata.indices : "nom_index" : {
+            /"indices"/ { in_indices_meta = 1 }
+
+            in_indices_meta && /^ *"[^"]+": *\{/ {
+                tmp = $0
+                gsub(/^ *"/, "", tmp); gsub(/" *:.*/, "", tmp)
+                # Ignorer les cles de structure connues
+                if (tmp !~ /^(mappings|settings|aliases|in_sync_allocations|routing_table|shards|indices)$/ \
+                    && length(tmp) > 0)
+                    current_meta_idx = tmp
+            }
+
+            # ---- in_sync_allocations ----
+            /"in_sync_allocations"/ { in_insync = 1; next }
+
+            in_insync && /^ *"[0-9]+"/ {
+                # Extraire le numero de shard : "0" : [...]
+                tmp = $0
+                gsub(/^ *"/, "", tmp)
+                gsub(/".*/, "", tmp)
+                insync_shard = tmp
+            }
+
+            in_insync && insync_shard != "" && /\[/ {
+                # Extraire les ids entre [ ] sur la meme ligne ou multi-ligne
+                tmp = $0
+                gsub(/.*\[/, "", tmp); gsub(/\].*/, "", tmp)
+                gsub(/"/, "", tmp);    gsub(/ /, "", tmp)
+                # Supprimer virgules de tete/queue
+                gsub(/^,/, "", tmp);   gsub(/,$/, "", tmp)
+                if (tmp != "")
+                    print current_meta_idx "|" insync_shard "|" tmp > insync_out
+                insync_shard = ""
+            }
+            # Sortir du bloc in_sync quand on rencontre la fermeture
+            in_insync && /^\s*\},?\s*$/ && insync_shard == "" { in_insync = 0 }
+
+            # ---- routing_table ----
+            /"routing_table"/ { in_routing = 1; in_indices_meta = 0 }
+
+            # Detecter l index courant dans routing_table
+            in_routing && /^ *"[^"]+": *\{/ {
+                tmp = $0
+                gsub(/^ *"/, "", tmp); gsub(/" *:.*/, "", tmp)
+                if (tmp !~ /^(shards|routing_table|indices)$/ && length(tmp) > 0)
+                    current_rt_idx = tmp
+            }
+
+            # Debut d un bloc shard
+            in_routing && /"shard" *:/ {
+                tmp = $0
+                gsub(/.*"shard" *: */, "", tmp)
+                gsub(/[^0-9].*/, "", tmp)
+                rt_shard   = tmp
+                rt_state   = ""
+                rt_alloc   = "NONE"
+                rt_primary = ""
+            }
+
+            in_routing && /"primary" *: *true/    { rt_primary = "true" }
+            in_routing && /"state" *: *"UNASSIGNED"/ { rt_state = "UNASSIGNED" }
+
+            # allocation_id.id — peut apparaitre apres "allocation_id" : {  "id" : "..."
+            in_routing && rt_shard != "" && /"id" *: *"/ {
+                tmp = $0
+                gsub(/.*"id" *: *"/, "", tmp)
+                gsub(/".*/, "", tmp)
+                if (tmp != "") rt_alloc = tmp
+            }
+
+            # Fin de bloc shard — ecrire si primaire UNASSIGNED
+            in_routing && /^\s*\},?\s*$/ && rt_primary == "true" && rt_state == "UNASSIGNED" {
+                print current_rt_idx "|" rt_shard "|" rt_alloc > routing_out
+                rt_primary = ""; rt_state = ""; rt_alloc = "NONE"; rt_shard = ""
+            }
+
+        ' insync_out="$CACHE_INSYNC" routing_out="$CACHE_ROUTING" "$CACHE_STATE_ALL"
+
+        log_ok "Parsing termine — insync: $(wc -l < "$CACHE_INSYNC" | tr -d ' ') entrees, routing: $(wc -l < "$CACHE_ROUTING" | tr -d ' ') entrees"
+    else
+        log "Cache insync/routing valides — parsing ignore"
+    fi
+
+    # ------------------------------------------------------------------
+    # PHASE B : Classification — 100% awk, zero fork, zero boucle shell
+    #
+    # Charge en memoire les deux tables :
+    #   insync[index|shard]  = "id1,id2,..."
+    #   routing[index|shard] = "allocation_id"
+    #
+    # Puis pour chaque ligne UNASSIGNED de l etape 4 :
+    #   routing[k] absent ou NONE → PERDU
+    #   routing[k] IN insync[k]   → ATTENTE_NOEUD
+    #   routing[k] NOT IN insync  → STALE
+    #
+    # Les compteurs sont ecrits dans des fichiers tmp pour eviter
+    # le sous-shell (les variables awk ne remontent pas dans bash
+    # a travers un pipe).
+    # ------------------------------------------------------------------
+
+    log "Classification des shards UNASSIGNED (awk pur — zero fork)..."
+
+    echo "$UNASSIGNED_FROM_ANALYSIS" | awk -F'|' \
+        -v insync_file="$CACHE_INSYNC" \
+        -v routing_file="$CACHE_ROUTING" \
+        -v os_host="$OS_HOST" \
+        -v log_unrec="$LOG_UNRECOVERABLE" \
+        -v log_remed="$LOG_REMEDIATION" \
+        -v cnt_file="$CACHE_STATE_DIR/counts.txt" \
+    '
+        BEGIN {
+            # Charger insync en memoire : insync["index|shard"] = "id1,id2,..."
+            while ((getline line < insync_file) > 0) {
+                n = split(line, f, "|")
+                if (n >= 3) insync[f[1] "|" f[2]] = f[3]
+            }
+            close(insync_file)
+
+            # Charger routing en memoire : routing["index|shard"] = "alloc_id"
+            while ((getline line < routing_file) > 0) {
+                n = split(line, f, "|")
+                if (n >= 3) routing[f[1] "|" f[2]] = f[3]
+            }
+            close(routing_file)
+
+            cnt_attente = 0; cnt_stale = 0; cnt_perdu = 0
+            fmt = "%-45s %-7s %-5s %-16s %-10s %s\n"
+        }
+
+        # Colonnes UNASSIGNED_FROM_ANALYSIS :
+        # tag|started|init|index|shard|role|state|store|node|ip
+        $1 == "UNASSIGNED" || $1 == "RISK" {
+            idx   = $4; shard = $5; role  = $6; store = $8
+            key   = idx "|" shard
+            size_gb = sprintf("%.2f", (store + 0) / 1024 / 1024 / 1024)
+
+            alloc_id   = (key in routing) ? routing[key] : "NONE"
+            insync_ids = (key in insync)  ? insync[key]  : ""
+
+            # --- Cas 1 : aucun allocation_id connu → perte totale ---
+            if (alloc_id == "NONE" || alloc_id == "") {
+                cnt_perdu++
+                detail = "Aucun allocation_id dans routing_table"
+                printf fmt, idx, shard, role, "PERDU", size_gb "GB", detail >> log_unrec
+                printf "# INDEX: %s | SHARD: %s | TAILLE: %sGB | PERTE TOTALE\n", \
+                    idx, shard, size_gb >> log_remed
+                printf "curl -ku admin:admin -X POST \"http://%s/_cluster/reroute\" \\\n", \
+                    os_host >> log_remed
+                printf "  -H \"Content-Type: application/json\" \\\n" >> log_remed
+                printf "  -d \x27{\"commands\":[{\"allocate_empty_primary\":{\"index\":\"%s\",\"shard\":%s,\"node\":\"NOEUD_CIBLE\",\"accept_data_loss\":true}}]}\x27\n\n", \
+                    idx, shard >> log_remed
+                next
+            }
+
+            # --- Cas 2 : shard absent de in_sync_allocations → perte totale ---
+            if (insync_ids == "") {
+                cnt_perdu++
+                detail = "Shard absent de in_sync_allocations"
+                printf fmt, idx, shard, role, "PERDU", size_gb "GB", detail >> log_unrec
+                printf "# INDEX: %s | SHARD: %s | TAILLE: %sGB | PERTE TOTALE\n", \
+                    idx, shard, size_gb >> log_remed
+                printf "curl -ku admin:admin -X POST \"http://%s/_cluster/reroute\" \\\n", \
+                    os_host >> log_remed
+                printf "  -H \"Content-Type: application/json\" \\\n" >> log_remed
+                printf "  -d \x27{\"commands\":[{\"allocate_empty_primary\":{\"index\":\"%s\",\"shard\":%s,\"node\":\"NOEUD_CIBLE\",\"accept_data_loss\":true}}]}\x27\n\n", \
+                    idx, shard >> log_remed
+                next
+            }
+
+            # --- Cas 3 : croiser alloc_id avec la liste in_sync ---
+            found = 0
+            n = split(insync_ids, ids, ",")
+            for (i = 1; i <= n; i++) {
+                if (ids[i] == alloc_id) { found = 1; break }
+            }
+
+            if (found) {
+                cnt_attente++
+                detail = "alloc_id in_sync — recovery auto au retour du noeud"
+                printf fmt, idx, shard, role, "ATTENTE", size_gb "GB", detail >> log_unrec
+            } else {
+                cnt_stale++
+                detail = "alloc_id hors in_sync (id=" alloc_id ")"
+                printf fmt, idx, shard, role, "STALE", size_gb "GB", detail >> log_unrec
+                printf "# INDEX: %s | SHARD: %s | TAILLE: %sGB | PERTE PARTIELLE POSSIBLE\n", \
+                    idx, shard, size_gb >> log_remed
+                printf "# allocation_id=%s hors in_sync=%s\n", alloc_id, insync_ids >> log_remed
+                printf "curl -ku admin:admin -X POST \"http://%s/_cluster/reroute\" \\\n", \
+                    os_host >> log_remed
+                printf "  -H \"Content-Type: application/json\" \\\n" >> log_remed
+                printf "  -d \x27{\"commands\":[{\"allocate_stale_primary\":{\"index\":\"%s\",\"shard\":%s,\"node\":\"NOEUD_CIBLE\",\"accept_data_loss\":true}}]}\x27\n\n", \
+                    idx, shard >> log_remed
+            }
+        }
+
+        END {
+            printf "%s|%s|%s\n", cnt_attente, cnt_stale, cnt_perdu > cnt_file
+        }
+    '
+
+    # Recuperer les compteurs — ecrits par awk dans un fichier
+    # (un pipe cree un sous-shell : les variables bash ne remonteraient pas)
+    if [ -f "$CACHE_STATE_DIR/counts.txt" ]; then
+        IFS='|' read -r COUNT_ATTENTE COUNT_STALE COUNT_PERDU \
+            < "$CACHE_STATE_DIR/counts.txt"
+    else
+        COUNT_ATTENTE=0; COUNT_STALE=0; COUNT_PERDU=0
+    fi
+
+    log_ok "Classification terminee (ATTENTE=$COUNT_ATTENTE STALE=$COUNT_STALE PERDU=$COUNT_PERDU)"
 
     # Bilan etape 5
     {
