@@ -1011,9 +1011,10 @@ log "Generation de shard_summary.csv..."
     awk -F'|' '
         {
             tag = $1; idx = $4; shard = $5; role = $6; state = $7
-            copies_started = $2; copies_init = $3
-            node = $9; ip = $10; size = $8
-            size_gb = sprintf("%.2f", size/1024/1024/1024)
+            copies_started = $2 + 0; copies_init = $3 + 0
+            node = $9; ip = $10
+            size = $8 + 0  # Force la conversion en nombre (0 si vide)
+            size_gb = (size > 0) ? sprintf("%.2f", size/1024/1024/1024) : "0.00"
 
             # Déterminer priority et details en fonction du tag
             if (tag == "RISK") {
@@ -1041,27 +1042,31 @@ log "Generation de shard_summary.csv..."
 
     # Shards classifiés en etape 5 (ATTENTE_NOEUD, STALE, PERDU)
     if [ -s "$LOG_UNRECOVERABLE" ]; then
-        awk -F' ' '
-            NR > 5 && NF >= 6 {
-                idx = $1; shard = $2; role = $3; status = $4; size_gb = $5
-                # Nettoyer size_gb (enlever GB)
+        # Sauter les 5 premières lignes (en-tête) et traiter le reste
+        tail -n +6 "$LOG_UNRECOVERABLE" | awk '
+            NF >= 6 {
+                idx = $1; shard = $2; role = $3; status = $4
+                # Extraire la taille (colonne 5, format "X.XXGB" ou "X.XX")
+                size_gb = $5
                 gsub(/GB/, "", size_gb)
-                # Déterminer priority
-                if (status == "PERDU") priority = 1
-                else if (status == "STALE") priority = 2
-                else if (status == "ATTENTE_NOEUD") priority = 3
-                else priority = 4
-                # Nettoyer details (colonnes 6+)
+                # Vérifier que size_gb est un nombre valide
+                if (size_gb !~ /^[0-9.]+$/) size_gb = "0.00"
+                # Le reste de la ligne est "details" (colonnes 6+)
                 details = ""
                 for (i=6; i<=NF; i++) {
                     if (i > 6) details = details " "
                     details = details $i
                 }
                 gsub(/"/, "", details)
+                # Déterminer priority
+                if (status == "PERDU") priority = 1
+                else if (status == "STALE") priority = 2
+                else if (status == "ATTENTE_NOEUD") priority = 3
+                else priority = 4
                 printf "%s,%s,%s,%s,%s,UNASSIGNED,0,0,,,%s,"%s"\n",
                     idx, shard, role, status, priority, size_gb, details
             }
-        ' "$LOG_UNRECOVERABLE"
+        '
     fi
 } > "$LOG_SHARD_SUMMARY_CSV"
 log_ok "shard_summary.csv genere ($(wc -l < "$LOG_SHARD_SUMMARY_CSV" | tr -d ' ') shards)"
