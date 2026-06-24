@@ -348,6 +348,18 @@ if [ "$LAST_CHECKPOINT" = "FILTER_DONE" ]; then
         "$CACHE_INDICES" \
         "indices (volumetrie)" || log_warn "Volumetrie indices non disponible - calcul depuis shards"
 
+    # Construire rep_flat.txt immediatement apres le fetch indices
+    # Necessaire a l etape 4 pour exclure les replicas d index ISM (rep=0) du tag RISK
+    # Format : index|nb_replicas
+    CACHE_REP="$CACHE_DIR/rep_flat.txt"
+    if [ -s "$CACHE_INDICES" ]; then
+        awk '{print $1 "|" $3}' "$CACHE_INDICES" > "$CACHE_REP"
+        log_ok "rep_flat construit ($(wc -l < "$CACHE_REP" | tr -d ' ') index) — ISM rep=0 sera exclu du RISK"
+    else
+        log_warn "CACHE_INDICES absent — shards ISM rep=0 non filtres a l etape 4"
+        touch "$CACHE_REP"
+    fi
+
     checkpoint_set "SHARDS_DONE"
     LAST_CHECKPOINT="SHARDS_DONE"
 fi
@@ -393,37 +405,66 @@ if [ "$LAST_CHECKPOINT" = "SHARDS_DONE" ]; then
 
     # ---------------------------------------------------------------------
     # Deuxième passe : appliquer la logique de classification en utilisant les comptes calculés
+    # On charge egalement le nombre de replicas par index (depuis _cat/indices)
+    # pour exclure d emblee les replicas d index a rep=0 (politique ISM) :
+    # ces shards sont UNASSIGNED volontairement, ils ne doivent pas etre tagués RISK
     # ---------------------------------------------------------------------
-    awk -v targets_file="$TARGET_NODES_FILE" -v started_file="/tmp/shard_started.$" -v init_file="/tmp/shard_init.$" '
+    awk -v targets_file="$TARGET_NODES_FILE" \
+        -v started_file="/tmp/shard_started.$" \
+        -v init_file="/tmp/shard_init.$" \
+        -v rep_file="$CACHE_DIR/rep_flat.txt" \
+    '
         BEGIN {
             while ((getline line < targets_file) > 0) targets[line]=1
-            while ((getline line < started_file) > 0) { split(line, a, "|"); started[a[1]"|"a[2]]=a[2] }
-            while ((getline line < init_file) > 0)    { split(line, a, "|"); init[a[1]"|"a[2]]=a[2] }
+            while ((getline line < started_file) > 0) {
+                split(line, a, "|"); started[a[1]"|"a[2]] = a[3]+0
+            }
+            while ((getline line < init_file) > 0) {
+                split(line, a, "|"); init[a[1]"|"a[2]] = a[3]+0
+            }
+            # Charger nb replicas : replicas["index"] = nb
+            # Construit depuis _cat/indices (format : index|nb_rep)
+            while ((getline line < rep_file) > 0) {
+                split(line, a, "|"); replicas[a[1]] = a[2]+0
+            }
         }
         {
-            key=$1"|"$2
-            # assure existence de compteurs
-            if (!(key in started)) started[key]=0
-            if (!(key in init))    init[key]=0
-            # déterminer si le shard a une copie sur un noeud cible
-            has_target=($6 in targets)
+            key = $1"|"$2
+            idx = $1; role = $3
+
+            # assurer existence des compteurs
+            if (!(key in started)) started[key] = 0
+            if (!(key in init))    init[key]    = 0
+
+            has_target = ($6 in targets)
+
             if (has_target) {
-                if ($4=="STARTED") {
-                    tag = (started[key]==1) ? "RISK" : "SAFE"
-                    print tag "|" started[key] "|" init[key] "|" $0
-                } else if ($4=="INITIALIZING") {
+                if ($4 == "STARTED") {
+                    # replica d un index a rep=0 : cas ISM, ne pas tagger RISK
+                    if (role == "r" && (idx in replicas) && replicas[idx] == 0) {
+                        print "NO_REPLICA|" started[key] "|" init[key] "|" $0
+                    } else {
+                        tag = (started[key] == 1) ? "RISK" : "SAFE"
+                        print tag "|" started[key] "|" init[key] "|" $0
+                    }
+                } else if ($4 == "INITIALIZING") {
                     print "REPLICATING|" started[key] "|" init[key] "|" $0
                 } else {
-                    tag = (started[key]<=1) ? "RISK" : "SAFE"
-                    print tag "|" started[key] "|" init[key] "|" $0
+                    # UNASSIGNED ou autre sur noeud cible
+                    if (role == "r" && (idx in replicas) && replicas[idx] == 0) {
+                        print "NO_REPLICA|" started[key] "|" init[key] "|" $0
+                    } else {
+                        tag = (started[key] <= 1) ? "RISK" : "SAFE"
+                        print tag "|" started[key] "|" init[key] "|" $0
+                    }
                 }
             } else {
-                if ($4=="INITIALIZING") {
+                if ($4 == "INITIALIZING") {
                     print "REPLICATING|" started[key] "|" init[key] "|" $0
-                } else if ($4=="UNASSIGNED") {
+                } else if ($4 == "UNASSIGNED") {
                     print "UNASSIGNED|" started[key] "|" init[key] "|" $0
                 }
-                # STARTED hors cible ignoré
+                # STARTED hors cible ignore
             }
         }
     ' "$CACHE_SHARDS" > "$RISK_FILE"
@@ -504,24 +545,28 @@ fi
 # ------------------------------------------------------------------------------
 # Comptage des catégories en une passe unique
 awk '
-    BEGIN {risk=safe=replic=unassigned=0}
+    BEGIN {risk=safe=replic=unassigned=norep=0}
     {
-        if ($1=="RISK")       risk++
-        else if ($1=="SAFE")  safe++
+        if      ($1=="RISK")        risk++
+        else if ($1=="SAFE")        safe++
         else if ($1=="REPLICATING") replic++
         else if ($1=="UNASSIGNED")  unassigned++
+        else if ($1=="NO_REPLICA")  norep++
     }
     END {
-        print risk > "/tmp/risk_cnt"
-        print safe > "/tmp/safe_cnt"
-        print replic > "/tmp/replic_cnt"
+        print risk      > "/tmp/risk_cnt"
+        print safe      > "/tmp/safe_cnt"
+        print replic    > "/tmp/replic_cnt"
         print unassigned > "/tmp/unassigned_cnt"
+        print norep     > "/tmp/norep4_cnt"
     }
 ' "$RISK_FILE"
 RISK_COUNT=$(cat /tmp/risk_cnt)
 SAFE_COUNT=$(cat /tmp/safe_cnt)
 REPLIC_COUNT=$(cat /tmp/replic_cnt)
 UNASSIGNED_COUNT=$(cat /tmp/unassigned_cnt)
+NOREP4_COUNT=$(cat /tmp/norep4_cnt 2>/dev/null || echo 0)
+rm -f /tmp/risk_cnt /tmp/safe_cnt /tmp/replic_cnt /tmp/unassigned_cnt /tmp/norep4_cnt
 
 # Entete commun des tableaux de shards
 SHARD_HEADER='%-45s %-7s %-5s %-13s %-8s %-8s %-25s %-16s %s'
@@ -638,6 +683,32 @@ fi
 cat "$LOG_UNASSIGNED" >> "$LOG_MAIN"
 
 # ------------------------------------------------------------------------------
+# LOG : shards sans replica par politique ISM (NO_REPLICA etape 4)
+# ------------------------------------------------------------------------------
+section "$LOG_NOREP" "SHARDS NO_REPLICA — number_of_replicas=0 par politique ISM"
+{
+    echo "Ces shards sont UNASSIGNED ou STARTED en copie unique volontairement."
+    echo "La politique ISM a defini number_of_replicas=0 sur leur index."
+    echo "Ils sont exclus du risk_shards.log — ce n est pas un defaut a corriger."
+    echo "Note : les shards PRIMAIRES de ces index restent analyses normalement."
+    echo ""
+} >> "$LOG_NOREP"
+
+if [ "${NOREP4_COUNT:-0}" -eq 0 ]; then
+    echo "ℹ️  Aucun shard ISM rep=0 detecte sur les noeuds cibles." >> "$LOG_NOREP"
+else
+    printf "ℹ️  %s shard(s) exclus du RISK (rep=0 par ISM)\n\n" "$NOREP4_COUNT" >> "$LOG_NOREP"
+    eval printf '"$SHARD_HEADER"\n' $SHARD_COLS >> "$LOG_NOREP"
+    echo "$SEP_LINE" >> "$LOG_NOREP"
+    grep "^NO_REPLICA|" "$RISK_FILE" | awk -F'|' '{
+        size_gb = sprintf("%.2f GB", $8/1024/1024/1024)
+        printf "%-45s %-7s %-5s %-13s %-8s %-8s %-25s %-16s %s\n",
+            $4, $5, $6, $7, $2, $3, $9, $10, size_gb
+    }' >> "$LOG_NOREP"
+fi
+cat "$LOG_NOREP" >> "$LOG_MAIN"
+
+# ------------------------------------------------------------------------------
 # LOG : shards OK
 # ------------------------------------------------------------------------------
 section "$LOG_SAFE" "SHARDS OK - Au moins une copie survivante hors noeuds cibles"
@@ -735,6 +806,7 @@ section "$LOG_NODE_STATS" "REPARTITION PAR NOEUD CIBLE"
     printf "  %-40s %s\n" "Shards a risque (copie unique STARTED) :" "$RISK_COUNT  ← DANGER"
     printf "  %-40s %s\n" "Shards en replication (INITIALIZING) :"   "$REPLIC_COUNT  ← pas encore proteges"
     printf "  %-40s %s\n" "Shards non assignes (UNASSIGNED) :"       "$UNASSIGNED_COUNT"
+    printf "  %-40s %s\n" "Shards ISM rep=0 (exclus du RISK) :"      "${NOREP4_COUNT:-0}  ← voulus, non bloquants"
     printf "  %-40s %s\n" "  dont ATTENTE_NOEUD (auto) :"            "${COUNT_ATTENTE:-n/a}"
     printf "  %-40s %s\n" "  dont STALE (perte partielle) :"         "${COUNT_STALE:-n/a}  ← intervention manuelle"
     printf "  %-40s %s\n" "  dont PERDU (perte totale) :"            "${COUNT_PERDU:-n/a}  ← intervention manuelle"
