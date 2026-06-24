@@ -31,6 +31,23 @@ CACHE_TTL=300         # secondes avant re-fetch (5 min)
 # AUTH="-u admin:motdepasse"
 # CURL_OPTS="-k"      # si TLS auto-signe
 
+# Initialiser les compteurs pour eviter les erreurs
+COUNT_ATTENTE=0
+COUNT_STALE=0
+COUNT_PERDU=0
+COUNT_NOREP=0
+PANNE_MODE=0
+OFFLINE_ZONES=""
+OFFLINE_NODES=""
+
+# ------------------------------------------------------------------------------
+# Nettoyage des fichiers temporaires en cas d'interruption
+# ------------------------------------------------------------------------------
+cleanup() {
+    rm -f /tmp/shard_started.* /tmp/shard_init.* 2>/dev/null
+}
+trap cleanup EXIT
+
 # ------------------------------------------------------------------------------
 # Parsing des arguments
 while [[ $# -gt 0 ]]; do
@@ -43,8 +60,6 @@ while [[ $# -gt 0 ]]; do
         *) OS_HOST="$1"; shift ;;
     esac
 done
-
-# Valeur par défaut du parallélisme si non fournie
 
 # ------------------------------------------------------------------------------
 # Construction du nom de dossier avec les parametres du run
@@ -89,6 +104,10 @@ LOG_INDEX_VOL="$LOG_DIR/index_volumes.log"     # volumetrie totale par index con
 LOG_SUMMARY="$LOG_DIR/summary.log"             # resume executif
 LOG_ERRORS="$LOG_DIR/errors.log"               # erreurs uniquement
 
+# Fichiers CSV (synthese)
+LOG_INDEX_SUMMARY_CSV="$LOG_DIR/index_summary.csv"
+LOG_SHARD_SUMMARY_CSV="$LOG_DIR/shard_summary.csv"
+
 # Fichiers internes (cache/checkpoint)
 CACHE_DIR="$LOG_DIR/cache"
 CHECKPOINT_FILE="$CACHE_DIR/checkpoint"
@@ -104,8 +123,6 @@ CACHE_INDICES="$CACHE_DIR/indices.txt"
 mkdir -p "$CACHE_DIR"
 
 # Construction de la base curl
-# Usage : ${CURL}_endpoint (sans slash intermediaire, l endpoint commence par _)
-# Ex : ${CURL}_cat/shards?v  →  curl ... http://host:9200/_cat/shards?v
 CURL="curl -s --max-time 30 --retry 3 --retry-delay 2 ${AUTH} ${CURL_OPTS} http://${OS_HOST}/"
 
 # ------------------------------------------------------------------------------
@@ -158,7 +175,6 @@ api_fetch() {
     local tmp="${cache_file}.tmp"
     local http_code
 
-    # CURL se termine par / et endpoint commence par _ : pas de double slash
     http_code=$(${CURL}${endpoint} -w "%{http_code}" -o "$tmp")
 
     if [ "$http_code" != "200" ] || [ ! -s "$tmp" ]; then
@@ -213,6 +229,8 @@ section() {
     echo "  node_stats.log        -> repartition par noeud cible"
     echo "  index_volumes.log     -> volumetrie totale des index concernes"
     echo "  summary.log           -> resume executif"
+    echo "  index_summary.csv     -> synthese par index (CSV)"
+    echo "  shard_summary.csv     -> detail par shard (CSV)"
     echo "  errors.log            -> erreurs uniquement"
     echo ""
 } | tee "$LOG_MAIN"
@@ -242,7 +260,7 @@ fi
 # ------------------------------------------------------------------------------
 if [ "$LAST_CHECKPOINT" = "START" ]; then
 
-    section "$LOG_NODES" "ETAPE 1/4 - Decouverte des noeuds"
+    section "$LOG_NODES" "ETAPE 1/5 - Decouverte des noeuds"
     checkpoint_set "NODES_RUNNING"
 
     api_fetch \
@@ -278,6 +296,57 @@ if [ "$LAST_CHECKPOINT" = "START" ]; then
         echo "Total : $NODE_TOTAL noeud(s)"
     } | tee -a "$LOG_NODES" >> "$LOG_MAIN"
 
+    # --------------------------------------------------------------------------
+    # DÉTECTION DES NŒUDS/ZONES HORS LIGNE
+    # --------------------------------------------------------------------------
+    # 1. Extraire toutes les zones et temp attendues
+    ALL_ZONES=$(awk -F'|' '{print $2}' "$CACHE_NODES_PARSED" | sort -u | tr '\n' ' ')
+    ALL_TEMPS=$(awk -F'|' '{print $3}' "$CACHE_NODES_PARSED" | sort -u | tr '\n' ' ')
+
+    # 2. Compter le nombre de nœuds par zone/temp
+    declare -A ZONE_COUNT
+    declare -A TEMP_COUNT
+    while IFS='|' read -r name zone temp; do
+        ZONE_COUNT["$zone"]=$(( ${ZONE_COUNT["$zone"]:-0} + 1 ))
+        TEMP_COUNT["$temp"]=$(( ${TEMP_COUNT["$temp"]:-0} + 1 ))
+    done < "$CACHE_NODES_PARSED"
+
+    # 3. Détecter les zones sans nœuds en ligne
+    OFFLINE_ZONES=""
+    for zone in $ALL_ZONES; do
+        if [ -z "${ZONE_COUNT["$zone"]}" ] || [ "${ZONE_COUNT["$zone"]}" -eq 0 ]; then
+            OFFLINE_ZONES="$OFFLINE_ZONES $zone"
+        fi
+    done
+    OFFLINE_ZONES=$(echo "$OFFLINE_ZONES" | xargs)
+
+    # 4. Détecter les nœuds manquants dans les zones partielles
+    #    Supposons que toutes les zones ont le même nombre de nœuds (symétrie)
+    MAX_ZONE_COUNT=0
+    for zone in $ALL_ZONES; do
+        [ "${ZONE_COUNT["$zone"]:-0}" -gt "$MAX_ZONE_COUNT" ] && MAX_ZONE_COUNT=${ZONE_COUNT["$zone"]}
+    done
+
+    for zone in $ALL_ZONES; do
+        current_count=${ZONE_COUNT["$zone"]:-0}
+        if [ "$current_count" -lt "$MAX_ZONE_COUNT" ] && [ "$current_count" -gt 0 ]; then
+            missing=$(( MAX_ZONE_COUNT - current_count ))
+            # Générer des noms de nœuds hypothétiques (ex: node-az1-01, node-az1-02, etc.)
+            for ((i=1; i<=$missing; i++)); do
+                OFFLINE_NODES="$OFFLINE_NODES node-${zone}-$(printf "%02d" $i)"
+            done
+        fi
+    done
+    OFFLINE_NODES=$(echo "$OFFLINE_NODES" | xargs | sed 's/ /,/g')
+
+    # 5. Log des nœuds/zones hors ligne
+    if [ -n "$OFFLINE_ZONES" ] || [ -n "$OFFLINE_NODES" ]; then
+        log_warn "PANNE DÉTECTÉE : Zones hors ligne : $OFFLINE_ZONES | Nœuds hors ligne : $OFFLINE_NODES"
+        PANNE_MODE=1
+    else
+        PANNE_MODE=0
+    fi
+
     checkpoint_set "NODES_DONE"
     LAST_CHECKPOINT="NODES_DONE"
 fi
@@ -287,19 +356,27 @@ fi
 # ------------------------------------------------------------------------------
 if [ "$LAST_CHECKPOINT" = "NODES_DONE" ]; then
 
-    section "$LOG_NODES" "ETAPE 2/4 - Filtrage des noeuds cibles"
+    section "$LOG_NODES" "ETAPE 2/5 - Filtrage des noeuds cibles"
     checkpoint_set "FILTER_RUNNING"
 
     awk -F'|' \
         -v ft="$FILTER_TEMP" \
-        -v fz="$FILTER_ZONE" '
-        {
+        -v fz="$FILTER_ZONE" \
+        '{
             name=$1; zone=$2; temp=$3
             if (ft != "" && temp != ft) next
             if (fz != "" && zone != fz) next
             print name
         }
     ' "$CACHE_NODES_PARSED" > "$TARGET_NODES_FILE"
+
+    # Ajouter les nœuds hors ligne à la liste des cibles
+    if [ -n "$OFFLINE_NODES" ]; then
+        echo "$OFFLINE_NODES" | tr ',' '\n' >> "$TARGET_NODES_FILE"
+        # Supprimer les doublons
+        sort -u "$TARGET_NODES_FILE" -o "$TARGET_NODES_FILE"
+        log "Nœuds hors ligne inclus dans l'analyse : $OFFLINE_NODES"
+    fi
 
     if [ ! -s "$TARGET_NODES_FILE" ]; then
         log_err "Aucun noeud ne correspond aux filtres (temp=$FILTER_TEMP zone=$FILTER_ZONE)"
@@ -327,11 +404,10 @@ fi
 # ------------------------------------------------------------------------------
 if [ "$LAST_CHECKPOINT" = "FILTER_DONE" ]; then
 
-    log "ETAPE 3/4 : Recuperation des shards et volumes du cluster"
+    log "ETAPE 3/5 : Recuperation des shards et volumes du cluster"
     checkpoint_set "SHARDS_RUNNING"
 
     # Colonnes : index shard prirep state store node ip segments.count
-    # state peut valoir : STARTED INITIALIZING RELOCATING UNASSIGNED
     api_fetch \
         "_cat/shards?h=index,shard,prirep,state,store,node,ip,segments.count&bytes=b&s=index,shard" \
         "$CACHE_SHARDS" \
@@ -342,15 +418,12 @@ if [ "$LAST_CHECKPOINT" = "FILTER_DONE" ]; then
     echo "Total shards cluster : $SHARD_TOTAL" >> "$LOG_SUMMARY"
 
     # Volumetrie reelle des index via _cat/indices
-    # Colonnes : health status index uuid pri rep docs.count docs.deleted store.size pri.store.size
     api_fetch \
         "_cat/indices?h=index,pri,rep,docs.count,store.size,pri.store.size&bytes=b&s=index" \
         "$CACHE_INDICES" \
         "indices (volumetrie)" || log_warn "Volumetrie indices non disponible - calcul depuis shards"
 
-    # Construire rep_flat.txt immediatement apres le fetch indices
-    # Necessaire a l etape 4 pour exclure les replicas d index ISM (rep=0) du tag RISK
-    # Format : index|nb_replicas
+    # Construire rep_flat.txt pour exclure les replicas ISM (rep=0)
     CACHE_REP="$CACHE_DIR/rep_flat.txt"
     if [ -s "$CACHE_INDICES" ]; then
         awk '{print $1 "|" $3}' "$CACHE_INDICES" > "$CACHE_REP"
@@ -369,27 +442,10 @@ fi
 # ------------------------------------------------------------------------------
 if [ "$LAST_CHECKPOINT" = "SHARDS_DONE" ]; then
 
-    log "ETAPE 4/4 : Analyse des risques (awk pur)"
+    log "ETAPE 4/5 : Analyse des risques (awk pur)"
     checkpoint_set "ANALYSIS_RUNNING"
 
-    # -------------------------------------------------------------------------
-    # Analyse principale des shards
-    #
-    # Tags de sortie :
-    #   RISK        shard STARTED sur noeud cible, copie unique → perte si arret
-    #   SAFE        shard STARTED sur noeud cible, replique ailleurs → OK
-    #   REPLICATING shard INITIALIZING sur noeud cible ou replica d un shard
-    #               cible qui se replique → replication en cours, pas encore sure
-    #   UNASSIGNED  shard non assigne dans le cluster (ni STARTED ni INITIALIZING)
-    #               dont le primaire est sur un noeud cible
-    #
-    # Colonnes du fichier de sortie :
-    #   TAG | COPIES_STARTED | COPIES_INITIALIZING | index | shard | prirep |
-    #   state | store | node | ip | segments
-    # -------------------------------------------------------------------------
-    # ---------------------------------------------------------------------
     # Première passe : compter les copies STARTED et INITIALIZING par (index|shard)
-    # ---------------------------------------------------------------------
     awk -v targets_file="$TARGET_NODES_FILE" '
         NR==FNR {targets[$1]=1; next}
         {
@@ -398,20 +454,15 @@ if [ "$LAST_CHECKPOINT" = "SHARDS_DONE" ]; then
             if ($4=="INITIALIZING") copies_init[key]++
         }
         END {
-            for (k in copies_started) print k"|"copies_started[k] > "/tmp/shard_started.$"
-            for (k in copies_init)    print k"|"copies_init[k]    > "/tmp/shard_init.$"
+            for (k in copies_started) print k"|"copies_started[k] > "/tmp/shard_started.$$"
+            for (k in copies_init)    print k"|"copies_init[k]    > "/tmp/shard_init.$$"
         }
     ' "$TARGET_NODES_FILE" "$CACHE_SHARDS"
 
-    # ---------------------------------------------------------------------
-    # Deuxième passe : appliquer la logique de classification en utilisant les comptes calculés
-    # On charge egalement le nombre de replicas par index (depuis _cat/indices)
-    # pour exclure d emblee les replicas d index a rep=0 (politique ISM) :
-    # ces shards sont UNASSIGNED volontairement, ils ne doivent pas etre tagués RISK
-    # ---------------------------------------------------------------------
+    # Deuxième passe : classification des shards
     awk -v targets_file="$TARGET_NODES_FILE" \
-        -v started_file="/tmp/shard_started.$" \
-        -v init_file="/tmp/shard_init.$" \
+        -v started_file="/tmp/shard_started.$$" \
+        -v init_file="/tmp/shard_init.$$" \
         -v rep_file="$CACHE_DIR/rep_flat.txt" \
     '
         BEGIN {
@@ -422,8 +473,6 @@ if [ "$LAST_CHECKPOINT" = "SHARDS_DONE" ]; then
             while ((getline line < init_file) > 0) {
                 split(line, a, "|"); init[a[1]"|"a[2]] = a[3]+0
             }
-            # Charger nb replicas : replicas["index"] = nb
-            # Construit depuis _cat/indices (format : index|nb_rep)
             while ((getline line < rep_file) > 0) {
                 split(line, a, "|"); replicas[a[1]] = a[2]+0
             }
@@ -431,16 +480,12 @@ if [ "$LAST_CHECKPOINT" = "SHARDS_DONE" ]; then
         {
             key = $1"|"$2
             idx = $1; role = $3
-
-            # assurer existence des compteurs
             if (!(key in started)) started[key] = 0
             if (!(key in init))    init[key]    = 0
-
             has_target = ($6 in targets)
 
             if (has_target) {
                 if ($4 == "STARTED") {
-                    # replica d un index a rep=0 : cas ISM, ne pas tagger RISK
                     if (role == "r" && (idx in replicas) && replicas[idx] == 0) {
                         print "NO_REPLICA|" started[key] "|" init[key] "|" $0
                     } else {
@@ -450,7 +495,6 @@ if [ "$LAST_CHECKPOINT" = "SHARDS_DONE" ]; then
                 } else if ($4 == "INITIALIZING") {
                     print "REPLICATING|" started[key] "|" init[key] "|" $0
                 } else {
-                    # UNASSIGNED ou autre sur noeud cible
                     if (role == "r" && (idx in replicas) && replicas[idx] == 0) {
                         print "NO_REPLICA|" started[key] "|" init[key] "|" $0
                     } else {
@@ -464,15 +508,13 @@ if [ "$LAST_CHECKPOINT" = "SHARDS_DONE" ]; then
                 } else if ($4 == "UNASSIGNED") {
                     print "UNASSIGNED|" started[key] "|" init[key] "|" $0
                 }
-                # STARTED hors cible ignore
             }
         }
     ' "$CACHE_SHARDS" > "$RISK_FILE"
-    # Nettoyage des fichiers temporaires de comptage
     rm -f /tmp/shard_started.$ /tmp/shard_init.$
 
-    # --- Stats par noeud cible ---
-    awk '
+    # Stats par noeud cible
+    awk -v tfile="$TARGET_NODES_FILE" '
         BEGIN {
             while ((getline node < tfile) > 0) targets[node]=1
         }
@@ -492,33 +534,28 @@ if [ "$LAST_CHECKPOINT" = "SHARDS_DONE" ]; then
                     n, count[n], size[n]/1024/1024/1024,
                     (init_count[n]+0), (other[n]+0)
         }
-    ' tfile="$TARGET_NODES_FILE" "$CACHE_SHARDS" > "$NODE_STATS_FILE"
+    ' "$CACHE_SHARDS" > "$NODE_STATS_FILE"
 
-    # --- Volumetrie totale par index concerne ---
-    # Identifier les index qui ont au moins un shard sur les noeuds cibles
-    awk '
+    # Volumetrie totale par index concerne
+    awk -v tfile="$TARGET_NODES_FILE" '
         BEGIN {
             while ((getline node < tfile) > 0) targets[node]=1
         }
         $4=="STARTED" && ($6 in targets) { concerned[$1] = 1 }
         END { for (idx in concerned) print idx }
-    ' tfile="$TARGET_NODES_FILE" "$CACHE_SHARDS" > "$CACHE_DIR/concerned_indexes.txt"
+    ' "$CACHE_SHARDS" > "$CACHE_DIR/concerned_indexes.txt"
 
-    # Croiser avec _cat/indices pour la volumetrie reelle
-    # Format cache_indices : index pri rep docs.count store.size pri.store.size
     if [ -s "$CACHE_INDICES" ]; then
-        awk '
+        awk -v cfile="$CACHE_DIR/concerned_indexes.txt" '
             BEGIN {
                 while ((getline idx < cfile) > 0) concerned[idx] = 1
             }
             ($1 in concerned) {
-                # Colonnes : index pri rep docs store_total pri_store
                 printf "%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, $6
             }
-        ' cfile="$CACHE_DIR/concerned_indexes.txt" "$CACHE_INDICES" > "$INDEX_VOL_FILE"
+        ' "$CACHE_INDICES" > "$INDEX_VOL_FILE"
     else
-        # Fallback : calcul depuis les shards si _cat/indices n est pas dispo
-        awk '
+        awk -v tfile="$TARGET_NODES_FILE" '
             BEGIN {
                 while ((getline node < tfile) > 0) targets[node]=1
             }
@@ -533,7 +570,7 @@ if [ "$LAST_CHECKPOINT" = "SHARDS_DONE" ]; then
                     printf "%s|-|-|-|%.0f|%.0f\n",
                         idx, total_size[idx], pri_size[idx]
             }
-        ' tfile="$TARGET_NODES_FILE" "$CACHE_SHARDS" > "$INDEX_VOL_FILE"
+        ' "$CACHE_SHARDS" > "$INDEX_VOL_FILE"
     fi
 
     checkpoint_set "ANALYSIS_DONE"
@@ -541,349 +578,24 @@ if [ "$LAST_CHECKPOINT" = "SHARDS_DONE" ]; then
 fi
 
 # ------------------------------------------------------------------------------
-# COMPTAGES PAR CATEGORIE
+# ETAPE 5 — Classification des shards UNASSIGNED
 # ------------------------------------------------------------------------------
-# Comptage des catégories en une passe unique
-awk '
-    BEGIN {risk=safe=replic=unassigned=norep=0}
-    {
-        if      ($1=="RISK")        risk++
-        else if ($1=="SAFE")        safe++
-        else if ($1=="REPLICATING") replic++
-        else if ($1=="UNASSIGNED")  unassigned++
-        else if ($1=="NO_REPLICA")  norep++
-    }
-    END {
-        print risk      > "/tmp/risk_cnt"
-        print safe      > "/tmp/safe_cnt"
-        print replic    > "/tmp/replic_cnt"
-        print unassigned > "/tmp/unassigned_cnt"
-        print norep     > "/tmp/norep4_cnt"
-    }
-' "$RISK_FILE"
-RISK_COUNT=$(cat /tmp/risk_cnt)
-SAFE_COUNT=$(cat /tmp/safe_cnt)
-REPLIC_COUNT=$(cat /tmp/replic_cnt)
-UNASSIGNED_COUNT=$(cat /tmp/unassigned_cnt)
-NOREP4_COUNT=$(cat /tmp/norep4_cnt 2>/dev/null || echo 0)
-rm -f /tmp/risk_cnt /tmp/safe_cnt /tmp/replic_cnt /tmp/unassigned_cnt /tmp/norep4_cnt
-
-# Entete commun des tableaux de shards
-SHARD_HEADER='%-45s %-7s %-5s %-13s %-8s %-8s %-25s %-16s %s'
-SHARD_COLS='"INDEX" "SHARD" "ROLE" "ETAT" "STARTED" "INIT" "NOEUD" "IP" "TAILLE"'
-SEP_LINE=$(printf '%0.s-' {1..145})
-
-print_shard_table() {
-    # $1 = tag a filtrer, $2 = fichier de sortie
-    local tag="$1" out="$2"
-    eval printf "\"$SHARD_HEADER\"\n" $SHARD_COLS >> "$out"
-    echo "$SEP_LINE" >> "$out"
-    grep "^${tag}|" "$RISK_FILE" | awk -F'|' -v OFS='' '{
-        size_gb = ($8 == "" || $8 == 0) ? "n/a" : sprintf("%.2f GB", $8/1024/1024/1024)
-        printf "%-45s %-7s %-5s %-13s %-8s %-8s %-25s %-16s %s\n",
-            $4, $5, $6, $7, $2, $3, $9, $10, size_gb
-    }' >> "$out"
-    echo "" >> "$out"
-}
-
-# ------------------------------------------------------------------------------
-# LOG : shards a risque
-# ------------------------------------------------------------------------------
-section "$LOG_RISK" "SHARDS A RISQUE - Copie unique STARTED (perte de donnees possible)"
-{
-    echo "Legende :"
-    echo "  ETAT    : etat actuel du shard sur ce noeud"
-    echo "  STARTED : nb de copies STARTED dans tout le cluster"
-    echo "  INIT    : nb de copies INITIALIZING (en cours de replication)"
-    echo "  Si STARTED=1 et INIT>0 : la replication est en cours mais pas encore finalisee"
-    echo ""
-} >> "$LOG_RISK"
-
-if [ "$RISK_COUNT" -eq 0 ]; then
-    echo "✅ Aucun shard a risque detecte." | tee -a "$LOG_RISK" >> "$LOG_MAIN"
-else
-    printf "🔴 %s shard(s) en COPIE UNIQUE\n\n" "$RISK_COUNT" | tee -a "$LOG_RISK" >> "$LOG_MAIN"
-    print_shard_table "RISK" "$LOG_RISK"
-
-    # Recap par index
-    {
-        echo "--- Recapitulatif par index ---"
-        printf "%-45s %-18s %-15s %s\n" "INDEX" "SHARDS A RISQUE" "TAILLE EXPOSEE" "REPLICATION EN COURS"
-        printf '%s\n' "$(printf '%0.s-' {1..95})"
-        grep "^RISK|" "$RISK_FILE" | awk -F'|' '{
-            count[$4]++
-            size[$4] += $8
-            if ($3+0 > 0) replic[$4]++
-        }
-        END {
-            for (i in count)
-                printf "%-45s %-18s %-15s %s\n",
-                    i, count[i],
-                    sprintf("%.2f GB", size[i]/1024/1024/1024),
-                    (replic[i]+0 > 0) ? "⚠️  oui (" replic[i] " shards)" : "non"
-        }' | sort -k2 -rn
-    } >> "$LOG_RISK"
-fi
-cat "$LOG_RISK" >> "$LOG_MAIN"
-
-# ------------------------------------------------------------------------------
-# LOG : shards en cours de replication (INITIALIZING)
-# ------------------------------------------------------------------------------
-section "$LOG_REPLICATING" "SHARDS EN COURS DE REPLICATION (INITIALIZING)"
-{
-    echo "Ces shards ne sont PAS encore proteges : la copie est en transit."
-    echo "  - Si STARTED=1 : le primaire est seul, le replica n est pas encore utilisable"
-    echo "  - Si STARTED=0 : le shard est en cours d affectation initiale"
-    echo "  Attendre la fin de la replication avant toute maintenance."
-    echo ""
-} >> "$LOG_REPLICATING"
-
-if [ "$REPLIC_COUNT" -eq 0 ]; then
-    echo "✅ Aucun shard en cours de replication." >> "$LOG_REPLICATING"
-else
-    printf "⚠️  %s shard(s) INITIALIZING\n\n" "$REPLIC_COUNT" >> "$LOG_REPLICATING"
-    print_shard_table "REPLICATING" "$LOG_REPLICATING"
-
-    # Recap par index
-    {
-        echo "--- Recapitulatif par index ---"
-        printf "%-45s %-20s %-12s %s\n" "INDEX" "SHARDS INITIALIZING" "STARTED" "TAILLE EN TRANSIT"
-        printf '%s\n' "$(printf '%0.s-' {1..90})"
-        grep "^REPLICATING|" "$RISK_FILE" | awk -F'|' '{
-            count[$4]++
-            started[$4] = $2
-            size[$4]  += $8
-        }
-        END {
-            for (i in count)
-                printf "%-45s %-20s %-12s %.2f GB\n",
-                    i, count[i], started[i], size[i]/1024/1024/1024
-        }' | sort -k2 -rn
-    } >> "$LOG_REPLICATING"
-fi
-cat "$LOG_REPLICATING" >> "$LOG_MAIN"
-
-# ------------------------------------------------------------------------------
-# LOG : shards vraiment non assignes
-# ------------------------------------------------------------------------------
-section "$LOG_UNASSIGNED" "SHARDS VRAIMENT NON ASSIGNES (UNASSIGNED)"
-{
-    echo "Ces shards n ont aucun noeud cible et ne sont pas en cours de replication."
-    echo "Causes possibles : watermark disque, filtres d allocation, manque de noeuds."
-    echo "Utiliser : GET /_cluster/allocation/explain pour diagnostiquer."
-    echo ""
-} >> "$LOG_UNASSIGNED"
-
-if [ "$UNASSIGNED_COUNT" -eq 0 ]; then
-    echo "✅ Aucun shard vraiment non assigne." >> "$LOG_UNASSIGNED"
-else
-    printf "⛔ %s shard(s) UNASSIGNED sans replication en cours\n\n" "$UNASSIGNED_COUNT" >> "$LOG_UNASSIGNED"
-    print_shard_table "UNASSIGNED" "$LOG_UNASSIGNED"
-fi
-cat "$LOG_UNASSIGNED" >> "$LOG_MAIN"
-
-# ------------------------------------------------------------------------------
-# LOG : shards sans replica par politique ISM (NO_REPLICA etape 4)
-# ------------------------------------------------------------------------------
-section "$LOG_NOREP" "SHARDS NO_REPLICA — number_of_replicas=0 par politique ISM"
-{
-    echo "Ces shards sont UNASSIGNED ou STARTED en copie unique volontairement."
-    echo "La politique ISM a defini number_of_replicas=0 sur leur index."
-    echo "Ils sont exclus du risk_shards.log — ce n est pas un defaut a corriger."
-    echo "Note : les shards PRIMAIRES de ces index restent analyses normalement."
-    echo ""
-} >> "$LOG_NOREP"
-
-if [ "${NOREP4_COUNT:-0}" -eq 0 ]; then
-    echo "ℹ️  Aucun shard ISM rep=0 detecte sur les noeuds cibles." >> "$LOG_NOREP"
-else
-    printf "ℹ️  %s shard(s) exclus du RISK (rep=0 par ISM)\n\n" "$NOREP4_COUNT" >> "$LOG_NOREP"
-    eval printf '"$SHARD_HEADER"\n' $SHARD_COLS >> "$LOG_NOREP"
-    echo "$SEP_LINE" >> "$LOG_NOREP"
-    grep "^NO_REPLICA|" "$RISK_FILE" | awk -F'|' '{
-        size_gb = sprintf("%.2f GB", $8/1024/1024/1024)
-        printf "%-45s %-7s %-5s %-13s %-8s %-8s %-25s %-16s %s\n",
-            $4, $5, $6, $7, $2, $3, $9, $10, size_gb
-    }' >> "$LOG_NOREP"
-fi
-cat "$LOG_NOREP" >> "$LOG_MAIN"
-
-# ------------------------------------------------------------------------------
-# LOG : shards OK
-# ------------------------------------------------------------------------------
-section "$LOG_SAFE" "SHARDS OK - Au moins une copie survivante hors noeuds cibles"
-{
-    printf "✅ %s shard(s) avec replicas OK\n\n" "$SAFE_COUNT"
-    eval printf "\"$SHARD_HEADER\"\n" $SHARD_COLS
-    echo "$SEP_LINE"
-    grep "^SAFE|" "$RISK_FILE" | awk -F'|' '{
-        size_gb = sprintf("%.2f GB", $8/1024/1024/1024)
-        printf "%-45s %-7s %-5s %-13s %-8s %-8s %-25s %-16s %s\n",
-            $4, $5, $6, $7, $2, $3, $9, $10, size_gb
-    }'
-} >> "$LOG_SAFE"
-
-# ------------------------------------------------------------------------------
-# LOG : volumetrie totale des index concernes
-# ------------------------------------------------------------------------------
-section "$LOG_INDEX_VOL" "VOLUMETRIE TOTALE DES INDEX CONCERNES"
-{
-    echo "Source : _cat/indices (taille reelle incluant tous les shards et replicas)"
-    echo "Colonnes :"
-    echo "  PRI           : nombre de shards primaires"
-    echo "  REP           : nombre de replicas configures"
-    echo "  DOCS          : nombre de documents"
-    echo "  TAILLE TOTALE : taille de tous les shards (primaires + replicas)"
-    echo "  TAILLE PRI    : taille des primaires uniquement"
-    echo "  STATUT        : risque detecte sur cet index"
-    echo ""
-    printf "%-45s %-5s %-5s %-12s %-16s %-16s %s\n" \
-           "INDEX" "PRI" "REP" "DOCS" "TAILLE TOTALE" "TAILLE PRI" "STATUT"
-    printf '%s\n' "$(printf '%0.s-' {1..125})"
-
-    awk -F'|' -v risk_file="$RISK_FILE" '
-        BEGIN {
-            while ((getline line < risk_file) > 0) {
-                split(line, f, "|")
-                tag = f[1]; idx = f[4]
-                if (tag == "RISK")        risk[idx]++
-                if (tag == "REPLICATING") replic[idx]++
-                if (tag == "UNASSIGNED")  unassign[idx]++
-            }
-        }
-        {
-            idx=$1; pri=$2; rep=$3; docs=$4
-            size_total=$5; size_pri=$6
-
-            size_total_gb = sprintf("%.2f GB", size_total/1024/1024/1024)
-            size_pri_gb   = sprintf("%.2f GB", size_pri/1024/1024/1024)
-
-            status = "OK"
-            if (risk[idx]+0 > 0)     status = "RISQUE(" risk[idx] "sh)"
-            if (replic[idx]+0 > 0)   status = status " REPLIC(" replic[idx] ")"
-            if (unassign[idx]+0 > 0) status = status " UNASSIGN(" unassign[idx] ")"
-
-            docs_fmt = (docs+0 > 1000000) ? sprintf("%.1fM", docs/1000000) \
-                     : (docs+0 > 1000)    ? sprintf("%.1fK", docs/1000) \
-                     : docs
-
-            printf "%-45s %-5s %-5s %-12s %-16s %-16s %s\n",
-                idx, pri, rep, docs_fmt, size_total_gb, size_pri_gb, status
-
-            total_size += size_total
-            total_pri  += size_pri
-            total_idx++
-        }
-        END {
-            printf "\n%-45s %-5s %-5s %-12s %-16s %-16s\n",
-                "TOTAL (" total_idx " index)", "", "", "",
-                sprintf("%.2f GB", total_size/1024/1024/1024),
-                sprintf("%.2f GB", total_pri/1024/1024/1024)
-        }
-    ' "$INDEX_VOL_FILE" | sort -k6 -r
-
-} | tee -a "$LOG_INDEX_VOL" >> "$LOG_MAIN"
-
-
-# ------------------------------------------------------------------------------
-# LOG : stats par noeud cible
-# ------------------------------------------------------------------------------
-section "$LOG_NODE_STATS" "REPARTITION PAR NOEUD CIBLE"
-{
-    printf "%-30s %-10s %-15s %-14s %s\n" \
-           "NOEUD" "STARTED" "TAILLE TOTALE" "INITIALIZING" "AUTRES ETATS"
-    printf '%s\n' "--------------------------------------------------------------------"
-    awk -F'|' '{printf "%-30s %-10s %-15s %-14s %s\n",
-        $1, $2, $3 " GB", $4, $5}' "$NODE_STATS_FILE"
-} | tee -a "$LOG_NODE_STATS" >> "$LOG_MAIN"
-
-# ------------------------------------------------------------------------------
-# LOG : resume executif
-# ------------------------------------------------------------------------------
-{
-    echo "RESULTATS"
-    echo "---------"
-    printf "  %-40s %s\n" "Shards a risque (copie unique STARTED) :" "$RISK_COUNT  ← DANGER"
-    printf "  %-40s %s\n" "Shards en replication (INITIALIZING) :"   "$REPLIC_COUNT  ← pas encore proteges"
-    printf "  %-40s %s\n" "Shards non assignes (UNASSIGNED) :"       "$UNASSIGNED_COUNT"
-    printf "  %-40s %s\n" "Shards ISM rep=0 (exclus du RISK) :"      "${NOREP4_COUNT:-0}  ← voulus, non bloquants"
-    printf "  %-40s %s\n" "  dont ATTENTE_NOEUD (auto) :"            "${COUNT_ATTENTE:-n/a}"
-    printf "  %-40s %s\n" "  dont STALE (perte partielle) :"         "${COUNT_STALE:-n/a}  ← intervention manuelle"
-    printf "  %-40s %s\n" "  dont PERDU (perte totale) :"            "${COUNT_PERDU:-n/a}  ← intervention manuelle"
-    printf "  %-40s %s\n" "Shards OK (repliques ailleurs) :"         "$SAFE_COUNT"
-    echo ""
-
-    # Volumetrie totale des index concernes
-    TOTAL_VOL=$(awk -F'|' '{sum+=$2} END {printf "%.2f", sum}' "$INDEX_VOL_FILE" 2>/dev/null || echo "?")
-    printf "  %-40s %s GB\n" "Volume total des index concernes :" "$TOTAL_VOL"
-    echo ""
-
-    if [ "$RISK_COUNT" -gt 0 ] || [ "$REPLIC_COUNT" -gt 0 ]; then
-        if [ "$RISK_COUNT" -gt 0 ]; then
-            echo "⛔ MAINTENANCE BLOQUEE"
-            echo "   $RISK_COUNT shard(s) en copie unique — perte de donnees certaine si le noeud s arrete"
-        fi
-        if [ "$REPLIC_COUNT" -gt 0 ]; then
-            echo "⚠️  REPLICATION EN COURS : $REPLIC_COUNT shard(s) pas encore proteges"
-            echo "   Attendre la fin de la replication puis relancer le diagnostic (--no-cache)"
-        fi
-        echo ""
-        echo "   Actions requises :"
-        echo "   1. Attendre fin replication : GET /_cat/shards?v | grep INITIALIZING"
-        echo "   2. Augmenter replicas si necessaire : PUT /index/_settings"
-        echo "      { \"index.number_of_replicas\": 1 }"
-        echo "   3. Attendre green : GET /_cluster/health?wait_for_status=green&timeout=30m"
-        echo "   4. Relancer : $0 $OS_HOST --no-cache $([ -n "$FILTER_TEMP" ] && echo "--temp $FILTER_TEMP") $([ -n "$FILTER_ZONE" ] && echo "--zone $FILTER_ZONE")"
-        echo ""
-        echo "   Index concernes (risque ou replication) :"
-        grep -E "^(RISK|REPLICATING)\|" "$RISK_FILE" | \
-            awk -F'|' '{print $4}' | sort -u | sed 's/^/     - /'
-    elif [ "$UNASSIGNED_COUNT" -gt 0 ]; then
-        echo "⚠️  ATTENTION : $UNASSIGNED_COUNT shard(s) UNASSIGNED sans replication"
-        echo "   Ces shards ne sont sur aucun noeud."
-        echo "   Diagnostiquer : GET /_cluster/allocation/explain"
-    else
-        echo "✅ MAINTENANCE POSSIBLE"
-        echo "   Aucun shard en copie unique ni en cours de replication."
-        echo "   Commande d exclusion recommandee avant arret :"
-        echo "   PUT /_cluster/settings"
-        echo "   { \"transient\": { \"cluster.routing.allocation.enable\": \"none\" } }"
-    fi
-    echo ""
-    echo "Fichiers generes dans : $LOG_DIR"
-    echo "  risk_shards.log        : shards en copie unique (DANGER)"
-    echo "  replicating_shards.log : shards en cours de replication"
-    echo "  unassigned_shards.log  : shards non assignes"
-    echo "  unrecoverable_shards.log : classification ATTENTE/STALE/PERDU"
-    [ "$NON_RECOV_TOTAL" -gt 0 ] && \
-    echo "  remediation.log        : commandes curl pret-a-l-emploi"
-    echo "  safe_shards.log        : shards OK"
-    echo "  index_volumes.log      : volumetrie totale par index"
-    echo "  node_stats.log         : repartition par noeud"
-} | tee -a "$LOG_SUMMARY" >> "$LOG_MAIN"
-
-# ------------------------------------------------------------------------------
-# ETAPE 5 — Classification des shards UNASSIGNED NODE_LEFT
-#           Integre depuis os_unrecoverable_shards.sh
-#           Appel _cluster/allocation/explain pour chaque shard sans copie active
-#           Categories : ATTENTE_NOEUD | STALE | PERDU
-# ------------------------------------------------------------------------------
-
-section "$LOG_UNRECOVERABLE" "ETAPE 5/5 - Classification des shards UNASSIGNED (recuperables vs perdus)"
+section "$LOG_UNRECOVERABLE" "ETAPE 5/5 - Classification des shards UNASSIGNED"
 
 # Extraire les shards tagués UNASSIGNED depuis l'analyse etape 4
-# Format RISK_FILE : TAG|started|init|index|shard|role|state|store|node|ip
 UNASSIGNED_FROM_ANALYSIS=$(grep "^UNASSIGNED|" "$RISK_FILE" 2>/dev/null || true)
 
 if [ -z "$UNASSIGNED_FROM_ANALYSIS" ]; then
     echo "✅ Aucun shard UNASSIGNED a classifier." | tee -a "$LOG_UNRECOVERABLE" >> "$LOG_MAIN"
-    COUNT_ATTENTE=0; COUNT_STALE=0; COUNT_PERDU=0
+    COUNT_ATTENTE=0
+    COUNT_STALE=0
+    COUNT_PERDU=0
 else
     TOTAL_TO_CLASSIFY=$(echo "$UNASSIGNED_FROM_ANALYSIS" | wc -l | tr -d ' ')
-    log "Classification de $TOTAL_TO_CLASSIFY shard(s) UNASSIGNED via _cluster/allocation/explain"
+    log "Classification de $TOTAL_TO_CLASSIFY shard(s) UNASSIGNED via _cluster/state"
 
     {
-        echo "Methode : GET /_cluster/allocation/explain par shard"
+        echo "Methode : GET /_cluster/state/metadata,routing_table par shard"
         echo "Categories :"
         echo "  ATTENTE_NOEUD : copie connue sur noeud absent -> recovery auto au retour"
         echo "  STALE         : copie perimee sur disque      -> allocate_stale_primary + accept_data_loss"
@@ -904,24 +616,10 @@ else
         echo ""
     } > "$LOG_REMEDIATION"
 
-    COUNT_ATTENTE=0; COUNT_STALE=0; COUNT_PERDU=0
-    CACHE_STATE_DIR="$CACHE_DIR/cluster_state"
-    mkdir -p "$CACHE_STATE_DIR"
-
-    # ------------------------------------------------------------------
-    # PHASE A : UN SEUL appel HTTP pour TOUS les index concernes
-    #
-    # On construit la liste CSV des index UNASSIGNED et on interroge
-    # le cluster state en une seule requete :
-    #   GET /_cluster/state/metadata,routing_table/idx1,idx2,...
-    #
-    # Puis UN SEUL awk parse le JSON et produit deux fichiers plats :
-    #   insync_flat.txt  : index|shard|id1,id2,...
-    #   routing_flat.txt : index|shard|allocation_id
-    #
-    # Aucune boucle shell, aucun fork supplementaire.
-    # ------------------------------------------------------------------
-
+    COUNT_ATTENTE=0
+    COUNT_STALE=0
+    COUNT_PERDU=0
+    COUNT_NOREP=0
     CACHE_STATE_DIR="$CACHE_DIR/cluster_state"
     mkdir -p "$CACHE_STATE_DIR"
 
@@ -930,8 +628,7 @@ else
     CACHE_ROUTING="$CACHE_STATE_DIR/routing_flat.txt"
     CACHE_REP="$CACHE_DIR/rep_flat.txt"
 
-    # Construire rep_flat.txt depuis le cache _cat/indices (deja fetche etape 3)
-    # Format : index|nb_replicas
+    # Construire rep_flat.txt depuis le cache _cat/indices
     if [ ! -s "$CACHE_REP" ] && [ -s "$CACHE_INDICES" ]; then
         awk '{print $1 "|" $3}' "$CACHE_INDICES" > "$CACHE_REP"
         log "rep_flat.txt construit depuis cache indices ($(wc -l < "$CACHE_REP" | tr -d ' ') index)"
@@ -959,7 +656,9 @@ else
         fi
         if [ "$HTTP_CODE" != "200" ] || [ ! -s "$CACHE_STATE_ALL" ]; then
             log_err "Fetch cluster state impossible — etape 5 ignoree"
-            COUNT_ATTENTE=0; COUNT_STALE=0; COUNT_PERDU=0
+            COUNT_ATTENTE=0
+            COUNT_STALE=0
+            COUNT_PERDU=0
         else
             log_ok "Cluster state fetche ($(wc -c < "$CACHE_STATE_ALL" | tr -d ' ') bytes)"
         fi
@@ -967,42 +666,28 @@ else
         log "Cache cluster state valide"
     fi
 
-    # ------------------------------------------------------------------
-    # UN SEUL awk sur le JSON brut — construit insync_flat et routing_flat
-    # en une passe, sans tr/sed/grep supplementaires.
-    #
-    # Strategie de parsing POSIX (sans match a 3 args) :
-    #   - gsub pour isoler les valeurs
-    #   - variables d etat pour suivre le contexte JSON
-    #
-    # insync_flat.txt  : index|shard|id1,id2,...
-    # routing_flat.txt : index|shard|allocation_id
-    # ------------------------------------------------------------------
-
+    # Parsing cluster state (un seul awk POSIX)
     if [ -s "$CACHE_STATE_ALL" ] && \
        { ! cache_valid "$CACHE_INSYNC" || ! cache_valid "$CACHE_ROUTING"; }; then
 
         log "Parsing cluster state (un seul awk POSIX)..."
 
         awk '
-            # ---- Detection du contexte index ----
-            # Dans metadata.indices : "nom_index" : {
+            # ---- Detection du contexte index ---
             /"indices"/ { in_indices_meta = 1 }
 
             in_indices_meta && /^ *"[^"]+": *\{/ {
                 tmp = $0
-                gsub(/^ *"/, "", tmp); gsub(/" *:.*/, "", tmp)
-                # Ignorer les cles de structure connues
+                gsub(/^ *"/, "", tmp); gsub(/".*/, "", tmp)
                 if (tmp !~ /^(mappings|settings|aliases|in_sync_allocations|routing_table|shards|indices)$/ \
                     && length(tmp) > 0)
                     current_meta_idx = tmp
             }
 
-            # ---- in_sync_allocations ----
+            # ---- in_sync_allocations ---
             /"in_sync_allocations"/ { in_insync = 1; next }
 
             in_insync && /^ *"[0-9]+"/ {
-                # Extraire le numero de shard : "0" : [...]
                 tmp = $0
                 gsub(/^ *"/, "", tmp)
                 gsub(/".*/, "", tmp)
@@ -1010,45 +695,46 @@ else
             }
 
             in_insync && insync_shard != "" && /\[/ {
-                # Extraire les ids entre [ ] sur la meme ligne ou multi-ligne
                 tmp = $0
                 gsub(/.*\[/, "", tmp); gsub(/\].*/, "", tmp)
                 gsub(/"/, "", tmp);    gsub(/ /, "", tmp)
-                # Supprimer virgules de tete/queue
                 gsub(/^,/, "", tmp);   gsub(/,$/, "", tmp)
                 if (tmp != "")
                     print current_meta_idx "|" insync_shard "|" tmp > insync_out
                 insync_shard = ""
             }
-            # Sortir du bloc in_sync quand on rencontre la fermeture
             in_insync && /^\s*\},?\s*$/ && insync_shard == "" { in_insync = 0 }
 
-            # ---- routing_table ----
+            # ---- routing_table ---
             /"routing_table"/ { in_routing = 1; in_indices_meta = 0 }
 
-            # Detecter l index courant dans routing_table
             in_routing && /^ *"[^"]+": *\{/ {
                 tmp = $0
-                gsub(/^ *"/, "", tmp); gsub(/" *:.*/, "", tmp)
+                gsub(/^ *"/, "", tmp); gsub(/".*/, "", tmp)
                 if (tmp !~ /^(shards|routing_table|indices)$/ && length(tmp) > 0)
                     current_rt_idx = tmp
             }
 
-            # Debut d un bloc shard
             in_routing && /"shard" *:/ {
                 tmp = $0
                 gsub(/.*"shard" *: */, "", tmp)
                 gsub(/[^0-9].*/, "", tmp)
-                rt_shard   = tmp
-                rt_state   = ""
-                rt_alloc   = "NONE"
+                rt_shard = tmp
+                rt_state = ""
+                rt_alloc = "NONE"
                 rt_primary = ""
+                rt_node = ""
             }
 
             in_routing && /"primary" *: *true/    { rt_primary = "true" }
             in_routing && /"state" *: *"UNASSIGNED"/ { rt_state = "UNASSIGNED" }
+            in_routing && /"node" *: *"[^"]+"/ {
+                tmp = $0
+                gsub(/.*"node" *: *"/, "", tmp)
+                gsub(/".*/, "", tmp)
+                rt_node = tmp
+            }
 
-            # allocation_id.id — peut apparaitre apres "allocation_id" : {  "id" : "..."
             in_routing && rt_shard != "" && /"id" *: *"/ {
                 tmp = $0
                 gsub(/.*"id" *: *"/, "", tmp)
@@ -1056,10 +742,9 @@ else
                 if (tmp != "") rt_alloc = tmp
             }
 
-            # Fin de bloc shard — ecrire si primaire UNASSIGNED
             in_routing && /^\s*\},?\s*$/ && rt_primary == "true" && rt_state == "UNASSIGNED" {
-                print current_rt_idx "|" rt_shard "|" rt_alloc > routing_out
-                rt_primary = ""; rt_state = ""; rt_alloc = "NONE"; rt_shard = ""
+                print current_rt_idx "|" rt_shard "|" rt_alloc "|" rt_node > routing_out
+                rt_primary = ""; rt_state = ""; rt_alloc = "NONE"; rt_shard = ""; rt_node = ""
             }
 
         ' insync_out="$CACHE_INSYNC" routing_out="$CACHE_ROUTING" "$CACHE_STATE_ALL"
@@ -1069,23 +754,7 @@ else
         log "Cache insync/routing valides — parsing ignore"
     fi
 
-    # ------------------------------------------------------------------
-    # PHASE B : Classification — 100% awk, zero fork, zero boucle shell
-    #
-    # Charge en memoire les deux tables :
-    #   insync[index|shard]  = "id1,id2,..."
-    #   routing[index|shard] = "allocation_id"
-    #
-    # Puis pour chaque ligne UNASSIGNED de l etape 4 :
-    #   routing[k] absent ou NONE → PERDU
-    #   routing[k] IN insync[k]   → ATTENTE_NOEUD
-    #   routing[k] NOT IN insync  → STALE
-    #
-    # Les compteurs sont ecrits dans des fichiers tmp pour eviter
-    # le sous-shell (les variables awk ne remontent pas dans bash
-    # a travers un pipe).
-    # ------------------------------------------------------------------
-
+    # Classification des shards UNASSIGNED
     log "Classification des shards UNASSIGNED (awk pur — zero fork)..."
 
     echo "$UNASSIGNED_FROM_ANALYSIS" | awk -F'|' \
@@ -1093,12 +762,19 @@ else
         -v routing_file="$CACHE_ROUTING" \
         -v rep_file="$CACHE_REP" \
         -v os_host="$OS_HOST" \
+        -v offline_nodes="$OFFLINE_NODES" \
         -v log_unrec="$LOG_UNRECOVERABLE" \
         -v log_norep="$LOG_NOREP" \
         -v log_remed="$LOG_REMEDIATION" \
         -v cnt_file="$CACHE_STATE_DIR/counts.txt" \
     '
         BEGIN {
+            # Charger offline_nodes dans un tableau
+            split(offline_nodes, nodes_list, ",")
+            for (i in nodes_list) {
+                offline[nodes_list[i]] = 1
+            }
+
             # Charger insync en memoire : insync["index|shard"] = "id1,id2,..."
             while ((getline line < insync_file) > 0) {
                 n = split(line, f, "|")
@@ -1106,14 +782,16 @@ else
             }
             close(insync_file)
 
-            # Charger routing en memoire : routing["index|shard"] = "alloc_id"
+            # Charger routing en memoire : routing["index|shard"] = "alloc_id|node"
             while ((getline line < routing_file) > 0) {
                 n = split(line, f, "|")
-                if (n >= 3) routing[f[1] "|" f[2]] = f[3]
+                if (n >= 3) {
+                    routing[f[1] "|" f[2]] = f[3] "|" f[4]
+                }
             }
             close(routing_file)
 
-            # Charger nb replicas par index : replicas["index"] = nb (0 = ISM/voulu)
+            # Charger nb replicas par index
             while ((getline line < rep_file) > 0) {
                 n = split(line, f, "|")
                 if (n >= 2) replicas[f[1]] = f[2] + 0
@@ -1124,16 +802,13 @@ else
             fmt = "%-45s %-7s %-5s %-16s %-10s %s\n"
         }
 
-        # Colonnes UNASSIGNED_FROM_ANALYSIS :
-        # tag|started|init|index|shard|role|state|store|node|ip
-        $1 == "UNASSIGNED" || $1 == "RISK" {
-            idx   = $4; shard = $5; role  = $6; store = $8
-            key   = idx "|" shard
+        # Colonnes UNASSIGNED_FROM_ANALYSIS : tag|started|init|index|shard|role|state|store|node|ip
+        $1 == "UNASSIGNED" {
+            idx = $4; shard = $5; role = $6; store = $8
+            key = idx "|" shard
             size_gb = sprintf("%.2f", (store + 0) / 1024 / 1024 / 1024)
 
-            # --- Cas 0 : index sans replica par politique ISM → signaler, ne pas bloquer ---
-            # number_of_replicas == 0 : UNASSIGNED est attendu pour les replicas
-            # mais un primaire UNASSIGNED reste un vrai probleme meme avec rep=0
+            # --- Cas 0 : index sans replica par politique ISM ---
             if ((idx in replicas) && replicas[idx] == 0 && role == "r") {
                 cnt_norep++
                 printf fmt, idx, shard, role, "NO_REPLICA", size_gb "GB", \
@@ -1141,10 +816,13 @@ else
                 next
             }
 
-            alloc_id   = (key in routing) ? routing[key] : "NONE"
-            insync_ids = (key in insync)  ? insync[key]  : ""
+            # Récupérer alloc_id et node depuis routing
+            alloc_info = (key in routing) ? routing[key] : "NONE|NONE"
+            split(alloc_info, a_info, "|")
+            alloc_id = a_info[1]
+            rt_node = a_info[2]
 
-            # --- Cas 1 : aucun allocation_id connu → perte totale ---
+            # --- Cas 1 : aucun allocation_id connu ---
             if (alloc_id == "NONE" || alloc_id == "") {
                 cnt_perdu++
                 detail = "Aucun allocation_id dans routing_table"
@@ -1159,7 +837,8 @@ else
                 next
             }
 
-            # --- Cas 2 : shard absent de in_sync_allocations → perte totale ---
+            # --- Cas 2 : shard absent de in_sync_allocations ---
+            insync_ids = (key in insync) ? insync[key] : ""
             if (insync_ids == "") {
                 cnt_perdu++
                 detail = "Shard absent de in_sync_allocations"
@@ -1181,13 +860,26 @@ else
                 if (ids[i] == alloc_id) { found = 1; break }
             }
 
+            # Vérifier si le nœud est hors ligne (priorité à ATTENTE_NOEUD)
+            is_offline = (rt_node in offline) ? 1 : 0
+
             if (found) {
-                cnt_attente++
-                detail = "alloc_id in_sync — recovery auto au retour du noeud"
-                printf fmt, idx, shard, role, "ATTENTE", size_gb "GB", detail >> log_unrec
+                if (is_offline) {
+                    cnt_attente++
+                    detail = "alloc_id in_sync — noeud hors ligne, recovery auto au retour"
+                } else {
+                    cnt_attente++
+                    detail = "alloc_id in_sync — recovery auto au retour du noeud"
+                }
+                printf fmt, idx, shard, role, "ATTENTE_NOEUD", size_gb "GB", detail >> log_unrec
             } else {
-                cnt_stale++
-                detail = "alloc_id hors in_sync (id=" alloc_id ")"
+                if (is_offline) {
+                    cnt_stale++
+                    detail = "alloc_id hors in_sync — noeud hors ligne, copie perimee"
+                } else {
+                    cnt_stale++
+                    detail = "alloc_id hors in_sync (id=" alloc_id ")"
+                }
                 printf fmt, idx, shard, role, "STALE", size_gb "GB", detail >> log_unrec
                 printf "# INDEX: %s | SHARD: %s | TAILLE: %sGB | PERTE PARTIELLE POSSIBLE\n", \
                     idx, shard, size_gb >> log_remed
@@ -1205,13 +897,15 @@ else
         }
     '
 
-    # Recuperer les compteurs — ecrits par awk dans un fichier
-    # (un pipe cree un sous-shell : les variables bash ne remonteraient pas)
+    # Recuperer les compteurs
     if [ -f "$CACHE_STATE_DIR/counts.txt" ]; then
         IFS='|' read -r COUNT_ATTENTE COUNT_STALE COUNT_PERDU COUNT_NOREP \
             < "$CACHE_STATE_DIR/counts.txt"
     else
-        COUNT_ATTENTE=0; COUNT_STALE=0; COUNT_PERDU=0; COUNT_NOREP=0
+        COUNT_ATTENTE=0
+        COUNT_STALE=0
+        COUNT_PERDU=0
+        COUNT_NOREP=0
     fi
 
     log_ok "Classification terminee (ATTENTE=$COUNT_ATTENTE STALE=$COUNT_STALE PERDU=$COUNT_PERDU)"
@@ -1244,49 +938,277 @@ else
 fi
 
 # Compter les non recuperables pour le summary
-NON_RECOV_TOTAL=$((${COUNT_STALE:-0} + ${COUNT_PERDU:-0}))
+NON_RECOV_TOTAL=$((COUNT_STALE + COUNT_PERDU))
 
 # ------------------------------------------------------------------------------
-# Affichage final console
+# GENERATION DES FICHIERS CSV (SYNTHESE)
+# ------------------------------------------------------------------------------
+
+# 1. Generer index_summary.csv
+log "Generation de index_summary.csv..."
+{
+    echo "index,total_shards,shards_at_risk,shards_replicating,shards_unassigned,shards_stale,shards_perdu,shards_norep,total_size_gb,status"
+    awk -F'|' -v risk_file="$RISK_FILE" -v unrecoverable_file="$LOG_UNRECOVERABLE" -v vol_file="$INDEX_VOL_FILE" '
+        BEGIN {
+            # Charger les compteurs par index depuis RISK_FILE
+            while ((getline line < risk_file) > 0) {
+                split(line, f, "|")
+                tag = f[1]; idx = f[4]
+                if (tag == "RISK")        risk[idx]++
+                if (tag == "REPLICATING") replic[idx]++
+                if (tag == "UNASSIGNED")  unassign[idx]++
+            }
+            # Charger les classifications depuis unrecoverable_shards.log
+            while ((getline line < unrecoverable_file) > 0) {
+                if (NF >= 4) {
+                    idx = $1; shard = $2; status = $4
+                    if (status == "STALE") stale[idx]++
+                    if (status == "PERDU") perdu[idx]++
+                    if (status == "ATTENTE_NOEUD") attente[idx]++
+                }
+            }
+            # Charger les tailles depuis INDEX_VOL_FILE
+            while ((getline line < vol_file) > 0) {
+                split(line, f, "|")
+                size_gb[f[1]] = sprintf("%.2f", f[5]/1024/1024/1024)
+                pri_count[f[1]] = f[2] + 0
+                rep_count[f[1]] = f[3] + 0
+            }
+        }
+        {
+            idx = $1
+            total_shards = pri_count[idx] + rep_count[idx]
+            risk_count = risk[idx] + 0
+            replic_count = replic[idx] + 0
+            unassign_count = unassign[idx] + 0
+            stale_count = stale[idx] + 0
+            perdu_count = perdu[idx] + 0
+            norep_count = 0  # A calculer si disponible
+            size = size_gb[idx]
+
+            # Déterminer le statut global de l index (priorité au plus critique)
+            status = "OK"
+            if (perdu_count > 0) status = "PERDU"
+            else if (stale_count > 0) status = "STALE"
+            else if (risk_count > 0) status = "RISK"
+            else if (replic_count > 0) status = "REPLICATING"
+            else if (unassign_count > 0) status = "UNASSIGNED"
+
+            printf "%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+                idx, total_shards, risk_count, replic_count, unassign_count,
+                stale_count, perdu_count, norep_count, size, status
+        }
+    ' "$INDEX_VOL_FILE"
+} > "$LOG_INDEX_SUMMARY_CSV"
+log_ok "index_summary.csv genere ($(wc -l < "$LOG_INDEX_SUMMARY_CSV" | tr -d ' ') index)"
+
+# 2. Generer shard_summary.csv
+log "Generation de shard_summary.csv..."
+{
+    echo "index,shard,role,status,priority,state,copies_started,copies_init,node,ip,size_gb,details"
+    
+    # Shards RISK/SAFE/REPLICATING de l etape 4
+    awk -F'|' '
+        {
+            tag = $1; idx = $4; shard = $5; role = $6; state = $7
+            copies_started = $2; copies_init = $3
+            node = $9; ip = $10; size = $8
+            size_gb = sprintf("%.2f", size/1024/1024/1024)
+
+            # Déterminer priority et details en fonction du tag
+            if (tag == "RISK") {
+                priority = 1
+                details = "Copie unique - perte si " node " tombe"
+            } else if (tag == "SAFE") {
+                priority = 4
+                details = copies_started " copies STARTED - safe"
+            } else if (tag == "REPLICATING") {
+                priority = 3
+                details = "Réplication en cours - " copies_init " copies INITIALIZING"
+            } else if (tag == "UNASSIGNED") {
+                priority = 2
+                details = "Non assigné - à classifier (étape 5)"
+            } else if (tag == "NO_REPLICA") {
+                priority = 4
+                details = "ISM rep=0 - normal, non bloquant"
+            }
+
+            printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n",
+                idx, shard, role, tag, priority, state, copies_started, copies_init,
+                node, ip, size_gb, details
+        }
+    ' "$RISK_FILE"
+
+    # Shards classifiés en etape 5 (ATTENTE_NOEUD, STALE, PERDU)
+    if [ -s "$LOG_UNRECOVERABLE" ]; then
+        awk -F' ' '
+            NR > 5 && NF >= 6 {
+                idx = $1; shard = $2; role = $3; status = $4; size_gb = $5
+                # Nettoyer size_gb (enlever GB)
+                gsub(/GB/, "", size_gb)
+                # Déterminer priority
+                if (status == "PERDU") priority = 1
+                else if (status == "STALE") priority = 2
+                else if (status == "ATTENTE_NOEUD") priority = 3
+                else priority = 4
+                # Nettoyer details (colonnes 6+)
+                details = ""
+                for (i=6; i<=NF; i++) {
+                    if (i > 6) details = details " "
+                    details = details $i
+                }
+                gsub(/"/, "", details)
+                printf "%s,%s,%s,%s,%s,UNASSIGNED,0,0,,,%s,"%s"\n",
+                    idx, shard, role, status, priority, size_gb, details
+            }
+        ' "$LOG_UNRECOVERABLE"
+    fi
+} > "$LOG_SHARD_SUMMARY_CSV"
+log_ok "shard_summary.csv genere ($(wc -l < "$LOG_SHARD_SUMMARY_CSV" | tr -d ' ') shards)"
+
+# ------------------------------------------------------------------------------
+# COMPTAGES PAR CATEGORIE (pour la synthese)
+# ------------------------------------------------------------------------------
+RISK_COUNT=$(grep -c "^RISK|" "$RISK_FILE" 2>/dev/null || echo 0)
+SAFE_COUNT=$(grep -c "^SAFE|" "$RISK_FILE" 2>/dev/null || echo 0)
+REPLIC_COUNT=$(grep -c "^REPLICATING|" "$RISK_FILE" 2>/dev/null || echo 0)
+UNASSIGNED_COUNT=$(grep -c "^UNASSIGNED|" "$RISK_FILE" 2>/dev/null || echo 0)
+NOREP4_COUNT=$(grep -c "^NO_REPLICA|" "$RISK_FILE" 2>/dev/null || echo 0)
+
+
+# ------------------------------------------------------------------------------
+# SYNTHESE CONSOLE FINALE (Adaptée pour les pannes)
 # ------------------------------------------------------------------------------
 echo ""
 echo "=================================================================="
-log_ok "Diagnostic termine"
+if [ "$PANNE_MODE" -eq 1 ]; then
+    log_ok "Diagnostic termine (MODE PANNE : nœuds/zones hors ligne détectés)"
+else
+    log_ok "Diagnostic termine"
+fi
+echo "=================================================================="
 echo ""
-echo "  📁 $LOG_DIR"
+echo " 📁 Logs : $LOG_DIR"
 echo ""
-printf "  %-30s %s\n"   "diagnostic.log"          "execution complete"
-printf "  %-30s %s\n"   "nodes.log"               "noeuds decouverts / filtres"
-printf "  %-30s %s (%s)\n" "risk_shards.log"         "shards DANGER"        "$RISK_COUNT"
-printf "  %-30s %s (%s)\n" "replicating_shards.log"  "replication en cours"  "$REPLIC_COUNT"
-printf "  %-30s %s (%s)\n" "unassigned_shards.log"   "non assignes"         "$UNASSIGNED_COUNT"
-printf "  %-30s %s (attente=%-3s stale=%-3s perdu=%-3s norep=%s)\n" \
-    "unrecoverable_shards.log" "classification" \
-    "${COUNT_ATTENTE:-0}" "${COUNT_STALE:-0}" "${COUNT_PERDU:-0}" "${COUNT_NOREP:-0}"
-[ "${COUNT_NOREP:-0}" -gt 0 ] && \
-printf "  %-30s %s (%s shards ISM rep=0)\n" "norep_shards.log" "shards sans replica" "${COUNT_NOREP:-0}"
-[ "$NON_RECOV_TOTAL" -gt 0 ] && \
-printf "  %-30s %s (%s commandes)\n" "remediation.log" "commandes curl" "$NON_RECOV_TOTAL"
-printf "  %-30s %s (%s)\n" "safe_shards.log"          "shards OK"            "$SAFE_COUNT"
-printf "  %-30s %s\n"   "index_volumes.log"        "volumetrie par index"
-printf "  %-30s %s\n"   "node_stats.log"           "stats par noeud cible"
-printf "  %-30s %s\n"   "summary.log"              "resume executif"
-[ -s "$LOG_ERRORS" ] && printf "  %-30s ⚠️\n" "errors.log"
+
+# --- Section PANNE (si nœuds/zones hors ligne) ---
+if [ "$PANNE_MODE" -eq 1 ]; then
+    echo " 🚨 PANNE DÉTECTÉE"
+    [ -n "$OFFLINE_ZONES" ] && echo "   Zones hors ligne : $OFFLINE_ZONES"
+    [ -n "$OFFLINE_NODES" ] && echo "   Nœuds hors ligne : $OFFLINE_NODES"
+    echo ""
+fi
+
+# --- Section PERTE DE DONNÉES (si COUNT_PERDU > 0) ---
+if [ "${COUNT_PERDU:-0}" -gt 0 ]; then
+    echo " 🔴 PERTE DE DONNÉES DÉTECTÉE"
+    echo "   $COUNT_PERDU shard(s) PERDU → Aucune copie valide connue"
+    PERDU_VOLUME=$(awk -F'|' '/PERDU/ {sum+=$8} END {printf "%.2f GB", sum/1024/1024/1024}' "$LOG_UNRECOVERABLE" 2>/dev/null || echo "?")
+    echo "   Volume perdu : $PERDU_VOLUME"
+    echo "   Index concernés :"
+    grep "|PERDU" "$LOG_UNRECOVERABLE" | awk '{print "     - " $1}' | sort -u
+    echo "   Actions :"
+    echo "     1. Vérifier les snapshots : GET /_snapshot/_all"
+    echo "     2. Exécuter les commandes dans remediation.log (accept_data_loss=true)"
+    echo "     3. Si pas de snapshot, les données sont PERDUES"
+    echo ""
+fi
+
+# --- Section RÉCUPÉRATION NÉCESSAIRE (STALE) ---
+if [ "${COUNT_STALE:-0}" -gt 0 ]; then
+    echo " ⚠️  RÉCUPÉRATION NÉCESSAIRE (STALE)"
+    echo "   $COUNT_STALE shard(s) STALE → Copie périmée sur disque"
+    STALE_VOLUME=$(awk -F'|' '/STALE/ {sum+=$8} END {printf "%.2f GB", sum/1024/1024/1024}' "$LOG_UNRECOVERABLE" 2>/dev/null || echo "?")
+    echo "   Volume concerné : $STALE_VOLUME"
+    echo "   Actions :"
+    echo "     - Exécuter les commandes dans remediation.log (allocate_stale_primary)"
+    echo ""
+fi
+
+# --- Section RÉCUPÉRATION AUTOMATIQUE (ATTENTE_NOEUD) ---
+if [ "${COUNT_ATTENTE:-0}" -gt 0 ]; then
+    echo " ℹ️  RÉCUPÉRATION AUTOMATIQUE (ATTENTE_NOEUD)"
+    echo "   $COUNT_ATTENTE shard(s) ATTENTE_NOEUD → Recovery auto au retour des nœuds"
+    ATTENTE_VOLUME=$(awk -F'|' '/ATTENTE/ {sum+=$8} END {printf "%.2f GB", sum/1024/1024/1024}' "$LOG_UNRECOVERABLE" 2>/dev/null || echo "?")
+    echo "   Volume concerné : $ATTENTE_VOLUME"
+    echo "   Actions :"
+    echo "     - Redémarrer les nœuds hors ligne pour recovery automatique"
+    echo ""
+fi
+
+# --- Section SHARDS À RISQUE (RISK) ---
+if [ "$RISK_COUNT" -gt 0 ]; then
+    echo " 🔴 SHARDS EN COPIE UNIQUE (RISK)"
+    echo "   $RISK_COUNT shard(s) en copie unique → Perte de données si nœud tombe"
+    echo "   Index concernés :"
+    grep "^RISK|" "$RISK_FILE" | awk -F'|' '{print "     - " $4}' | sort -u
+    echo "   Actions :"
+    echo "     - Augmenter number_of_replicas sur les index concernés"
+    echo "     - Attendre la réplication : GET /_cluster/health?wait_for_status=green"
+    echo ""
+fi
+
+# --- Section SHARDS EN RÉPLICATION (REPLICATING) ---
+if [ "$REPLIC_COUNT" -gt 0 ]; then
+    echo " ⚠️  SHARDS EN RÉPLICATION (INITIALIZING)"
+    echo "   $REPLIC_COUNT shard(s) en cours de réplication → Pas encore protégés"
+    echo "   Actions :"
+    echo "     - Attendre la fin de la réplication"
+    echo ""
+fi
+
+# --- Synthèse Globale ---
+echo " ✅ SYNTHÈSE GLOBALE"
+echo "   - Total shards analysés : $SHARD_TOTAL"
+TOTAL_VOL=$(awk -F'|' '{sum+=$5} END {printf "%.2f GB", sum/1024/1024/1024}' "$CACHE_SHARDS" 2>/dev/null || echo "?")
+echo "   - Volume total concerné : $TOTAL_VOL"
+echo "   - Nœuds en ligne : $NODE_TOTAL"
+[ -n "$OFFLINE_NODES" ] && echo "   - Nœuds hors ligne : $OFFLINE_NODES"
+[ -n "$OFFLINE_ZONES" ] && echo "   - Zones hors ligne : $OFFLINE_ZONES"
 echo ""
-if   [ "$RISK_COUNT"       -gt 0 ]; then echo "  🔴 $RISK_COUNT shard(s) en copie unique       → maintenance BLOQUEE"
+
+# --- Décision de Maintenance ---
+if [ "${COUNT_PERDU:-0}" -gt 0 ]; then
+    echo " ❌ MAINTENANCE IMPOSSIBLE : Perte de données détectée (shards PERDU)"
+elif [ "$RISK_COUNT" -gt 0 ]; then
+    echo " ❌ MAINTENANCE BLOQUÉE : $RISK_COUNT shard(s) en copie unique (RISK)"
+elif [ "$REPLIC_COUNT" -gt 0 ]; then
+    echo " ⚠️  MAINTENANCE À REPORTER : $REPLIC_COUNT shard(s) en réplication"
+elif [ "${COUNT_STALE:-0}" -gt 0 ]; then
+    echo " ⚠️  MAINTENANCE À REPORTER : $COUNT_STALE shard(s) STALE à récupérer"
+elif [ "$PANNE_MODE" -eq 1 ]; then
+    echo " ⚠️  MAINTENANCE DÉCONSEILLÉE : Panne en cours (nœuds/zones hors ligne)"
+else
+    echo " ✅ MAINTENANCE POSSIBLE : Aucun shard à risque"
 fi
-if   [ "$REPLIC_COUNT"    -gt 0 ]; then echo "  ⚠️  $REPLIC_COUNT shard(s) en replication   → attendre avant maintenance"
-fi
-if   [ "${COUNT_STALE:-0}"  -gt 0 ]; then echo "  ⚠️  $COUNT_STALE shard(s) STALE             → allocate_stale_primary requis (voir remediation.log)"
-fi
-if   [ "${COUNT_PERDU:-0}"  -gt 0 ]; then echo "  🔴 $COUNT_PERDU shard(s) PERDU              → allocate_empty_primary requis (voir remediation.log)"
-fi
-if   [ "$RISK_COUNT" -eq 0 ] && [ "$REPLIC_COUNT" -eq 0 ] && \
-     [ "${COUNT_STALE:-0}" -eq 0 ] && [ "${COUNT_PERDU:-0}" -eq 0 ]; then
-    echo "  ✅ Aucun shard a risque ni non recuperable → maintenance possible"
-fi
+
 echo ""
-echo "  Reprise : $0 $OS_HOST --resume --log-dir $LOG_DIR"
+echo " 📊 FICHIERS GÉNÉRÉS"
+echo "   - $LOG_DIR/summary.log          → Résumé exécutif"
+echo "   - $LOG_DIR/risk_shards.log       → Shards en copie unique (DANGER)"
+echo "   - $LOG_DIR/remediation.log       → Commandes de récupération"
+echo "   - $LOG_DIR/unrecoverable_shards.log → Classification (ATTENTE/STALE/PERDU)"
+echo "   - $LOG_DIR/index_summary.csv     → Synthèse par index (CSV)"
+echo "   - $LOG_DIR/shard_summary.csv     → Détail par shard (CSV)"
+echo ""
+
+# --- Actions Recommandées ---
+echo " 💡 ACTIONS RECOMMANDÉES"
+if [ "${COUNT_PERDU:-0}" -gt 0 ]; then
+    echo "   1. Vérifier les snapshots : GET /_snapshot/_all"
+    echo "   2. Exécuter remediation.log pour les shards PERDU (accept_data_loss=true)"
+fi
+if [ "${COUNT_STALE:-0}" -gt 0 ]; then
+    echo "   3. Exécuter remediation.log pour les shards STALE (allocate_stale_primary)"
+fi
+if [ "$PANNE_MODE" -eq 1 ]; then
+    echo "   4. Redémarrer les nœuds hors ligne : $OFFLINE_NODES"
+fi
+if [ "$RISK_COUNT" -gt 0 ]; then
+    echo "   5. Augmenter les replicas : PUT /<index>/_settings -d '{"index.number_of_replicas": 1}'"
+fi
+echo "   6. Relancer le diagnostic : $0 $OS_HOST --no-cache $([ -n "$FILTER_TEMP" ] && echo "--temp $FILTER_TEMP") $([ -n "$FILTER_ZONE" ] && echo "--zone $FILTER_ZONE")"
+echo ""
 echo "=================================================================="
 
 checkpoint_set "DONE"
