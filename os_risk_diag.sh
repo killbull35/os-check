@@ -81,7 +81,8 @@ LOG_RISK="$LOG_DIR/risk_shards.log"            # shards en copie unique (DANGER)
 LOG_REPLICATING="$LOG_DIR/replicating_shards.log" # shards INITIALIZING (replication en cours)
 LOG_UNASSIGNED="$LOG_DIR/unassigned_shards.log"   # shards vraiment non assignes
 LOG_UNRECOVERABLE="$LOG_DIR/unrecoverable_shards.log" # shards STALE ou PERDU (etape 5)
-LOG_REMEDIATION="$LOG_DIR/remediation.log"         # commandes de remediation generees
+LOG_NOREP="$LOG_DIR/norep_shards.log"                 # shards sans replica par politique ISM
+LOG_REMEDIATION="$LOG_DIR/remediation.log"            # commandes de remediation generees
 LOG_SAFE="$LOG_DIR/safe_shards.log"            # shards avec replicas OK
 LOG_NODE_STATS="$LOG_DIR/node_stats.log"       # repartition par noeud
 LOG_INDEX_VOL="$LOG_DIR/index_volumes.log"     # volumetrie totale par index concerne
@@ -855,6 +856,17 @@ else
     CACHE_STATE_ALL="$CACHE_STATE_DIR/all_indexes.json"
     CACHE_INSYNC="$CACHE_STATE_DIR/insync_flat.txt"
     CACHE_ROUTING="$CACHE_STATE_DIR/routing_flat.txt"
+    CACHE_REP="$CACHE_DIR/rep_flat.txt"
+
+    # Construire rep_flat.txt depuis le cache _cat/indices (deja fetche etape 3)
+    # Format : index|nb_replicas
+    if [ ! -s "$CACHE_REP" ] && [ -s "$CACHE_INDICES" ]; then
+        awk '{print $1 "|" $3}' "$CACHE_INDICES" > "$CACHE_REP"
+        log "rep_flat.txt construit depuis cache indices ($(wc -l < "$CACHE_REP" | tr -d ' ') index)"
+    elif [ ! -s "$CACHE_REP" ]; then
+        log_warn "CACHE_INDICES absent — nombre de replicas non disponible (ISM non detecte)"
+        touch "$CACHE_REP"
+    fi
 
     # Liste CSV des index uniques ayant des shards UNASSIGNED
     INDEX_CSV=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
@@ -1007,8 +1019,10 @@ else
     echo "$UNASSIGNED_FROM_ANALYSIS" | awk -F'|' \
         -v insync_file="$CACHE_INSYNC" \
         -v routing_file="$CACHE_ROUTING" \
+        -v rep_file="$CACHE_REP" \
         -v os_host="$OS_HOST" \
         -v log_unrec="$LOG_UNRECOVERABLE" \
+        -v log_norep="$LOG_NOREP" \
         -v log_remed="$LOG_REMEDIATION" \
         -v cnt_file="$CACHE_STATE_DIR/counts.txt" \
     '
@@ -1027,7 +1041,14 @@ else
             }
             close(routing_file)
 
-            cnt_attente = 0; cnt_stale = 0; cnt_perdu = 0
+            # Charger nb replicas par index : replicas["index"] = nb (0 = ISM/voulu)
+            while ((getline line < rep_file) > 0) {
+                n = split(line, f, "|")
+                if (n >= 2) replicas[f[1]] = f[2] + 0
+            }
+            close(rep_file)
+
+            cnt_attente = 0; cnt_stale = 0; cnt_perdu = 0; cnt_norep = 0
             fmt = "%-45s %-7s %-5s %-16s %-10s %s\n"
         }
 
@@ -1037,6 +1058,16 @@ else
             idx   = $4; shard = $5; role  = $6; store = $8
             key   = idx "|" shard
             size_gb = sprintf("%.2f", (store + 0) / 1024 / 1024 / 1024)
+
+            # --- Cas 0 : index sans replica par politique ISM → signaler, ne pas bloquer ---
+            # number_of_replicas == 0 : UNASSIGNED est attendu pour les replicas
+            # mais un primaire UNASSIGNED reste un vrai probleme meme avec rep=0
+            if ((idx in replicas) && replicas[idx] == 0 && role == "r") {
+                cnt_norep++
+                printf fmt, idx, shard, role, "NO_REPLICA", size_gb "GB", \
+                    "ISM/politique : number_of_replicas=0 (voulu, pas un risque)" >> log_norep
+                next
+            }
 
             alloc_id   = (key in routing) ? routing[key] : "NONE"
             insync_ids = (key in insync)  ? insync[key]  : ""
@@ -1098,17 +1129,17 @@ else
         }
 
         END {
-            printf "%s|%s|%s\n", cnt_attente, cnt_stale, cnt_perdu > cnt_file
+            printf "%s|%s|%s|%s\n", cnt_attente, cnt_stale, cnt_perdu, cnt_norep > cnt_file
         }
     '
 
     # Recuperer les compteurs — ecrits par awk dans un fichier
     # (un pipe cree un sous-shell : les variables bash ne remonteraient pas)
     if [ -f "$CACHE_STATE_DIR/counts.txt" ]; then
-        IFS='|' read -r COUNT_ATTENTE COUNT_STALE COUNT_PERDU \
+        IFS='|' read -r COUNT_ATTENTE COUNT_STALE COUNT_PERDU COUNT_NOREP \
             < "$CACHE_STATE_DIR/counts.txt"
     else
-        COUNT_ATTENTE=0; COUNT_STALE=0; COUNT_PERDU=0
+        COUNT_ATTENTE=0; COUNT_STALE=0; COUNT_PERDU=0; COUNT_NOREP=0
     fi
 
     log_ok "Classification terminee (ATTENTE=$COUNT_ATTENTE STALE=$COUNT_STALE PERDU=$COUNT_PERDU)"
@@ -1120,14 +1151,20 @@ else
         printf "  ✅ ATTENTE_NOEUD : %-5s shard(s) — recovery auto au retour du noeud\n" "$COUNT_ATTENTE"
         printf "  ⚠️  STALE         : %-5s shard(s) — copie perimee, perte partielle possible\n" "$COUNT_STALE"
         printf "  🔴 PERDU          : %-5s shard(s) — aucune copie, perte totale\n" "$COUNT_PERDU"
+        printf "  ℹ️  NO_REPLICA     : %-5s shard(s) — rep=0 par politique ISM (non bloquant)\n" "${COUNT_NOREP:-0}"
         echo ""
         NON_RECOV=$((COUNT_STALE + COUNT_PERDU))
         if [ "$NON_RECOV" -gt 0 ]; then
             echo "⛔ $NON_RECOV shard(s) NON recuperables automatiquement"
             echo "   Voir : $LOG_REMEDIATION"
         else
-            echo "✅ Tous les shards UNASSIGNED seront recuperes automatiquement"
+            echo "✅ Tous les shards UNASSIGNED problematiques seront recuperes automatiquement"
             echo "   (au retour du/des noeud(s) absent(s))"
+        fi
+        if [ "${COUNT_NOREP:-0}" -gt 0 ]; then
+            echo ""
+            echo "ℹ️  ${COUNT_NOREP} shard(s) ignores car number_of_replicas=0 (ISM/voulu)"
+            echo "   Voir : $LOG_NOREP"
         fi
     } | tee -a "$LOG_UNRECOVERABLE" >> "$LOG_MAIN"
 
@@ -1151,9 +1188,11 @@ printf "  %-30s %s\n"   "nodes.log"               "noeuds decouverts / filtres"
 printf "  %-30s %s (%s)\n" "risk_shards.log"         "shards DANGER"        "$RISK_COUNT"
 printf "  %-30s %s (%s)\n" "replicating_shards.log"  "replication en cours"  "$REPLIC_COUNT"
 printf "  %-30s %s (%s)\n" "unassigned_shards.log"   "non assignes"         "$UNASSIGNED_COUNT"
-printf "  %-30s %s (attente=%-3s stale=%-3s perdu=%s)\n" \
+printf "  %-30s %s (attente=%-3s stale=%-3s perdu=%-3s norep=%s)\n" \
     "unrecoverable_shards.log" "classification" \
-    "${COUNT_ATTENTE:-0}" "${COUNT_STALE:-0}" "${COUNT_PERDU:-0}"
+    "${COUNT_ATTENTE:-0}" "${COUNT_STALE:-0}" "${COUNT_PERDU:-0}" "${COUNT_NOREP:-0}"
+[ "${COUNT_NOREP:-0}" -gt 0 ] && \
+printf "  %-30s %s (%s shards ISM rep=0)\n" "norep_shards.log" "shards sans replica" "${COUNT_NOREP:-0}"
 [ "$NON_RECOV_TOTAL" -gt 0 ] && \
 printf "  %-30s %s (%s commandes)\n" "remediation.log" "commandes curl" "$NON_RECOV_TOTAL"
 printf "  %-30s %s (%s)\n" "safe_shards.log"          "shards OK"            "$SAFE_COUNT"
