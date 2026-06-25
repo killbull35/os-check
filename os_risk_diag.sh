@@ -637,9 +637,10 @@ else
         touch "$CACHE_REP"
     fi
 
-    # Liste CSV des index uniques ayant des shards UNASSIGNED
-    INDEX_CSV=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
+    # Liste CSV des index uniques ayant des shards UNASSIGNED (encodée pour URL)
+    INDEX_CSV_RAW=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
         | awk -F'|' '{print $4}' | sort -u | tr '\n' ',' | sed 's/,$//')
+    INDEX_CSV=$(echo "$INDEX_CSV_RAW" | sed 's/,/%2C/g')
 
     INDEX_COUNT=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
         | awk -F'|' '{print $4}' | sort -u | wc -l | tr -d ' ')
