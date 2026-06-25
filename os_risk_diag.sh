@@ -638,18 +638,26 @@ else
     fi
 
     # Liste CSV des index uniques ayant des shards UNASSIGNED (encodée pour URL)
+    # Extraire uniquement le 4ème champ (index) et vérifier qu'il est non vide
     INDEX_CSV_RAW=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
-        | awk -F'|' '{print $4}' | sort -u | tr '\n' ',' | sed 's/,$//')
+        | awk -F'|' 'NF >= 4 && $4 != "" {print $4}' | sort -u | tr '\n' ',' | sed 's/,$//')
     INDEX_CSV=$(echo "$INDEX_CSV_RAW" | sed 's/,/%2C/g')
 
     INDEX_COUNT=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
-        | awk -F'|' '{print $4}' | sort -u | wc -l | tr -d ' ')
+        | awk -F'|' 'NF >= 4 && $4 != "" {print $4}' | sort -u | wc -l | tr -d ' ')
 
     log "Fetch cluster state (metadata+routing_table) — $INDEX_COUNT index en un seul appel"
 
     if ! cache_valid "$CACHE_STATE_ALL"; then
-        HTTP_CODE=$(${CURL}_cluster/state/metadata,routing_table/${INDEX_CSV}?pretty \
-            -w "%{http_code}" -o "$CACHE_STATE_ALL" 2>/dev/null)
+        if [ -z "$INDEX_CSV" ]; then
+            # Aucun index avec des shards UNASSIGNED — utiliser tous les index
+            log_warn "Aucun index avec des shards UNASSIGNED — fetch de tous les index"
+            HTTP_CODE=$(${CURL}_cluster/state/metadata,routing_table?pretty \
+                -w "%{http_code}" -o "$CACHE_STATE_ALL" 2>/dev/null)
+        else
+            HTTP_CODE=$(${CURL}_cluster/state/metadata,routing_table/${INDEX_CSV}?pretty \
+                -w "%{http_code}" -o "$CACHE_STATE_ALL" 2>/dev/null)
+        fi
         if [ "$HTTP_CODE" != "200" ] || [ ! -s "$CACHE_STATE_ALL" ]; then
             log_warn "Fetch filtre echoue (HTTP $HTTP_CODE) — fallback sans filtre index"
             HTTP_CODE=$(${CURL}_cluster/state/metadata,routing_table?pretty \
@@ -1070,40 +1078,39 @@ log "Generation de shard_summary.csv..."
         ' "$RISK_FILE"
     fi
 
-    # Shards classifiés en etape 5 (ATTENTE_NOEUD, STALE, PERDU)
-    if [ -s "$LOG_UNRECOVERABLE" ]; then
-        # Sauter les 5 premières lignes (en-tête) et traiter le reste
-        tail -n +6 "$LOG_UNRECOVERABLE" | awk '
-            NF >= 6 {
+    # Shards classifiés en etape 5 (ATTENTE_NOEUD, STALE, PERDU, NO_REPLICA)
+    if [ -s "$CLASSIFICATION_DATA" ]; then
+        awk -F'|' '
+            {
                 idx = $1; shard = $2; role = $3; status = $4
-                # Extraire la taille (colonne 5, format "X.XXGB" ou "X.XX")
                 size_gb = $5
-                gsub(/GB/, "", size_gb)
+                node = $6
+                details = $7
+                
                 # Vérifier que size_gb est un nombre valide
                 if (size_gb !~ /^[0-9.]+$/) size_gb = "0.00"
-                # Le reste de la ligne est "details" (colonnes 6+)
-                details = ""
-                for (i=6; i<=NF; i++) {
-                    if (i > 6) details = details " "
-                    details = details $i
-                }
-                gsub(/"/, "", details)
+                
                 # Déterminer priority
                 if (status == "PERDU") priority = 1
                 else if (status == "STALE") priority = 2
                 else if (status == "ATTENTE_NOEUD") priority = 3
+                else if (status == "NO_REPLICA") priority = 4
                 else priority = 4
-                printf "%s,%s,%s,%s,%s,UNASSIGNED,0,0,,,%s,\"%s\"\n",
-                    idx, shard, role, status, priority, size_gb, details
+                
+                # gsub pour échapper les guillemets dans details
+                gsub(/"/, "", details)
+                
+                printf "%s,%s,%s,%s,%s,UNASSIGNED,0,0,%s,,%s,\"%s\"\n",
+                    idx, shard, role, status, priority, node, size_gb, details
             }
-        '
+        ' "$CLASSIFICATION_DATA"
     fi
 } > "$LOG_SHARD_SUMMARY_CSV"
 
 # Vérifier que le CSV n'est pas vide (juste l'en-tête)
 SHARD_CSV_LINES=$(wc -l < "$LOG_SHARD_SUMMARY_CSV" | tr -d ' ')
 if [ "$SHARD_CSV_LINES" -eq 1 ]; then
-    log_warn "shard_summary.csv vide (aucune donnée disponible dans RISK_FILE ou LOG_UNRECOVERABLE)"
+    log_warn "shard_summary.csv vide (aucune donnée disponible dans RISK_FILE ou CLASSIFICATION_DATA)"
 else
     log_ok "shard_summary.csv genere ($((SHARD_CSV_LINES - 1)) shards)"
 fi
