@@ -756,6 +756,10 @@ else
 
     # Classification des shards UNASSIGNED
     log "Classification des shards UNASSIGNED (awk pur — zero fork)..."
+    
+    # Fichier de données structuré pour les CSV (format : index|shard|role|status|size_gb|node|details)
+    CLASSIFICATION_DATA="$CACHE_STATE_DIR/classification_data.txt"
+    touch "$CLASSIFICATION_DATA"
 
     echo "$UNASSIGNED_FROM_ANALYSIS" | awk -F'|' \
         -v insync_file="$CACHE_INSYNC" \
@@ -767,6 +771,7 @@ else
         -v log_norep="$LOG_NOREP" \
         -v log_remed="$LOG_REMEDIATION" \
         -v cnt_file="$CACHE_STATE_DIR/counts.txt" \
+        -v class_data="$CLASSIFICATION_DATA" \
     '
         BEGIN {
             # Charger offline_nodes dans un tableau
@@ -811,8 +816,10 @@ else
             # --- Cas 0 : index sans replica par politique ISM ---
             if ((idx in replicas) && replicas[idx] == 0 && role == "r") {
                 cnt_norep++
-                printf fmt, idx, shard, role, "NO_REPLICA", size_gb "GB", \
-                    "ISM/politique : number_of_replicas=0 (voulu, pas un risque)" >> log_norep
+                detail = "ISM/politique : number_of_replicas=0 (voulu, pas un risque)"
+                printf fmt, idx, shard, role, "NO_REPLICA", size_gb "GB", detail >> log_norep
+                # Écrire dans class_data (format : index|shard|role|status|size_gb|node|details)
+                printf "%s|%s|%s|NO_REPLICA|%.2f||%s\n", idx, shard, role, size_gb, detail >> class_data
                 next
             }
 
@@ -834,6 +841,8 @@ else
                 printf "  -H \"Content-Type: application/json\" \\\n" >> log_remed
                 printf "  -d \x27{\"commands\":[{\"allocate_empty_primary\":{\"index\":\"%s\",\"shard\":%s,\"node\":\"NOEUD_CIBLE\",\"accept_data_loss\":true}}]}\x27\n\n", \
                     idx, shard >> log_remed
+                # Écrire dans class_data
+                printf "%s|%s|%s|PERDU|%.2f|%s|%s\n", idx, shard, role, size_gb, rt_node, detail >> class_data
                 next
             }
 
@@ -850,6 +859,8 @@ else
                 printf "  -H \"Content-Type: application/json\" \\\n" >> log_remed
                 printf "  -d \x27{\"commands\":[{\"allocate_empty_primary\":{\"index\":\"%s\",\"shard\":%s,\"node\":\"NOEUD_CIBLE\",\"accept_data_loss\":true}}]}\x27\n\n", \
                     idx, shard >> log_remed
+                # Écrire dans class_data
+                printf "%s|%s|%s|PERDU|%.2f|%s|%s\n", idx, shard, role, size_gb, rt_node, detail >> class_data
                 next
             }
 
@@ -871,7 +882,10 @@ else
                     cnt_attente++
                     detail = "alloc_id in_sync — recovery auto au retour du noeud"
                 }
-                printf fmt, idx, shard, role, "ATTENTE_NOEUD", size_gb "GB", detail >> log_unrec
+                status = "ATTENTE_NOEUD"
+                printf fmt, idx, shard, role, status, size_gb "GB", detail >> log_unrec
+                # Écrire dans class_data
+                printf "%s|%s|%s|%s|%.2f|%s|%s\n", idx, shard, role, status, size_gb, rt_node, detail >> class_data
             } else {
                 if (is_offline) {
                     cnt_stale++
@@ -880,7 +894,8 @@ else
                     cnt_stale++
                     detail = "alloc_id hors in_sync (id=" alloc_id ")"
                 }
-                printf fmt, idx, shard, role, "STALE", size_gb "GB", detail >> log_unrec
+                status = "STALE"
+                printf fmt, idx, shard, role, status, size_gb "GB", detail >> log_unrec
                 printf "# INDEX: %s | SHARD: %s | TAILLE: %sGB | PERTE PARTIELLE POSSIBLE\n", \
                     idx, shard, size_gb >> log_remed
                 printf "# allocation_id=%s hors in_sync=%s\n", alloc_id, insync_ids >> log_remed
@@ -889,6 +904,8 @@ else
                 printf "  -H \"Content-Type: application/json\" \\\n" >> log_remed
                 printf "  -d \x27{\"commands\":[{\"allocate_stale_primary\":{\"index\":\"%s\",\"shard\":%s,\"node\":\"NOEUD_CIBLE\",\"accept_data_loss\":true}}]}\x27\n\n", \
                     idx, shard >> log_remed
+                # Écrire dans class_data
+                printf "%s|%s|%s|%s|%.2f|%s|%s\n", idx, shard, role, status, size_gb, rt_node, detail >> class_data
             }
         }
 
@@ -951,7 +968,7 @@ log "Generation de index_summary.csv..."
 if [ -s "$INDEX_VOL_FILE" ]; then
     {
         echo "index,total_shards,shards_at_risk,shards_replicating,shards_unassigned,shards_stale,shards_perdu,shards_norep,total_size_gb,status"
-        awk -F'|' -v risk_file="$RISK_FILE" -v unrecoverable_file="$LOG_UNRECOVERABLE" '
+        awk -F'|' -v risk_file="$RISK_FILE" -v class_data="$CLASSIFICATION_DATA" '
             BEGIN {
                 # Charger les compteurs par index depuis RISK_FILE
                 while ((getline line < risk_file) > 0) {
@@ -962,10 +979,11 @@ if [ -s "$INDEX_VOL_FILE" ]; then
                     if (tag == "UNASSIGNED")  unassign[idx]++
                     if (tag == "NO_REPLICA")  norep[idx]++
                 }
-                # Charger les classifications depuis unrecoverable_shards.log
-                while ((getline line < unrecoverable_file) > 0) {
+                # Charger les classifications depuis classification_data.txt (format : index|shard|role|status|...)
+                while ((getline line < class_data) > 0) {
+                    split(line, f, "|")
                     if (NF >= 4) {
-                        idx = $1; status = $4
+                        idx = f[1]; status = f[4]
                         if (status == "STALE") stale[idx]++
                         if (status == "PERDU") perdu[idx]++
                         if (status == "ATTENTE_NOEUD") attente[idx]++
@@ -1044,7 +1062,7 @@ log "Generation de shard_summary.csv..."
                     details = "Statut inconnu"
                 }
 
-                printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n",
+                printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,\"%s\"\n",
                     idx, shard, role, tag, priority, state, copies_started, copies_init,
                     node, ip, size_gb, details
             }
@@ -1074,7 +1092,7 @@ log "Generation de shard_summary.csv..."
                 else if (status == "STALE") priority = 2
                 else if (status == "ATTENTE_NOEUD") priority = 3
                 else priority = 4
-                printf "%s,%s,%s,%s,%s,UNASSIGNED,0,0,,,%s,"%s"\n",
+                printf "%s,%s,%s,%s,%s,UNASSIGNED,0,0,,,%s,\"%s\"\n",
                     idx, shard, role, status, priority, size_gb, details
             }
         '
