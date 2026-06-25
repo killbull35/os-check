@@ -946,99 +946,110 @@ NON_RECOV_TOTAL=$((COUNT_STALE + COUNT_PERDU))
 
 # 1. Generer index_summary.csv
 log "Generation de index_summary.csv..."
-{
-    echo "index,total_shards,shards_at_risk,shards_replicating,shards_unassigned,shards_stale,shards_perdu,shards_norep,total_size_gb,status"
-    awk -F'|' -v risk_file="$RISK_FILE" -v unrecoverable_file="$LOG_UNRECOVERABLE" -v vol_file="$INDEX_VOL_FILE" '
-        BEGIN {
-            # Charger les compteurs par index depuis RISK_FILE
-            while ((getline line < risk_file) > 0) {
-                split(line, f, "|")
-                tag = f[1]; idx = f[4]
-                if (tag == "RISK")        risk[idx]++
-                if (tag == "REPLICATING") replic[idx]++
-                if (tag == "UNASSIGNED")  unassign[idx]++
-            }
-            # Charger les classifications depuis unrecoverable_shards.log
-            while ((getline line < unrecoverable_file) > 0) {
-                if (NF >= 4) {
-                    idx = $1; shard = $2; status = $4
-                    if (status == "STALE") stale[idx]++
-                    if (status == "PERDU") perdu[idx]++
-                    if (status == "ATTENTE_NOEUD") attente[idx]++
+
+# Vérifier que INDEX_VOL_FILE existe et n'est pas vide
+if [ -s "$INDEX_VOL_FILE" ]; then
+    {
+        echo "index,total_shards,shards_at_risk,shards_replicating,shards_unassigned,shards_stale,shards_perdu,shards_norep,total_size_gb,status"
+        awk -F'|' -v risk_file="$RISK_FILE" -v unrecoverable_file="$LOG_UNRECOVERABLE" '
+            BEGIN {
+                # Charger les compteurs par index depuis RISK_FILE
+                while ((getline line < risk_file) > 0) {
+                    split(line, f, "|")
+                    tag = f[1]; idx = f[4]
+                    if (tag == "RISK")        risk[idx]++
+                    if (tag == "REPLICATING") replic[idx]++
+                    if (tag == "UNASSIGNED")  unassign[idx]++
+                    if (tag == "NO_REPLICA")  norep[idx]++
+                }
+                # Charger les classifications depuis unrecoverable_shards.log
+                while ((getline line < unrecoverable_file) > 0) {
+                    if (NF >= 4) {
+                        idx = $1; status = $4
+                        if (status == "STALE") stale[idx]++
+                        if (status == "PERDU") perdu[idx]++
+                        if (status == "ATTENTE_NOEUD") attente[idx]++
+                    }
                 }
             }
-            # Charger les tailles depuis INDEX_VOL_FILE
-            while ((getline line < vol_file) > 0) {
-                split(line, f, "|")
-                size_gb[f[1]] = sprintf("%.2f", f[5]/1024/1024/1024)
-                pri_count[f[1]] = f[2] + 0
-                rep_count[f[1]] = f[3] + 0
+            {
+                idx = $1
+                pri = $2 + 0; rep = $3 + 0
+                total_shards = pri + rep
+                risk_count = risk[idx] + 0
+                replic_count = replic[idx] + 0
+                unassign_count = unassign[idx] + 0
+                stale_count = stale[idx] + 0
+                perdu_count = perdu[idx] + 0
+                norep_count = norep[idx] + 0
+                size = $5 + 0
+                size_gb = (size > 0) ? sprintf("%.2f", size/1024/1024/1024) : "0.00"
+
+                # Déterminer le statut global de l index (priorité au plus critique)
+                status = "OK"
+                if (perdu_count > 0) status = "PERDU"
+                else if (stale_count > 0) status = "STALE"
+                else if (risk_count > 0) status = "RISK"
+                else if (replic_count > 0) status = "REPLICATING"
+                else if (unassign_count > 0) status = "UNASSIGNED"
+
+                printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
+                    idx, total_shards, risk_count, replic_count, unassign_count,
+                    stale_count, perdu_count, norep_count, size_gb, status
             }
-        }
-        {
-            idx = $1
-            total_shards = pri_count[idx] + rep_count[idx]
-            risk_count = risk[idx] + 0
-            replic_count = replic[idx] + 0
-            unassign_count = unassign[idx] + 0
-            stale_count = stale[idx] + 0
-            perdu_count = perdu[idx] + 0
-            norep_count = 0  # A calculer si disponible
-            size = size_gb[idx]
-
-            # Déterminer le statut global de l index (priorité au plus critique)
-            status = "OK"
-            if (perdu_count > 0) status = "PERDU"
-            else if (stale_count > 0) status = "STALE"
-            else if (risk_count > 0) status = "RISK"
-            else if (replic_count > 0) status = "REPLICATING"
-            else if (unassign_count > 0) status = "UNASSIGNED"
-
-            printf "%s,%s,%s,%s,%s,%s,%s,%s,%s\n",
-                idx, total_shards, risk_count, replic_count, unassign_count,
-                stale_count, perdu_count, norep_count, size, status
-        }
-    ' "$INDEX_VOL_FILE"
-} > "$LOG_INDEX_SUMMARY_CSV"
-log_ok "index_summary.csv genere ($(wc -l < "$LOG_INDEX_SUMMARY_CSV" | tr -d ' ') index)"
+        ' "$INDEX_VOL_FILE"
+    } > "$LOG_INDEX_SUMMARY_CSV"
+    log_ok "index_summary.csv genere ($(wc -l < "$LOG_INDEX_SUMMARY_CSV" | tr -d ' ') index)"
+else
+    # Créer un CSV vide avec juste l'en-tête
+    echo "index,total_shards,shards_at_risk,shards_replicating,shards_unassigned,shards_stale,shards_perdu,shards_norep,total_size_gb,status" > "$LOG_INDEX_SUMMARY_CSV"
+    log_warn "index_summary.csv vide (INDEX_VOL_FILE non disponible)"
+fi
 
 # 2. Generer shard_summary.csv
 log "Generation de shard_summary.csv..."
+
+# Créer l'en-tête
 {
     echo "index,shard,role,status,priority,state,copies_started,copies_init,node,ip,size_gb,details"
-    
-    # Shards RISK/SAFE/REPLICATING de l etape 4
-    awk -F'|' '
-        {
-            tag = $1; idx = $4; shard = $5; role = $6; state = $7
-            copies_started = $2 + 0; copies_init = $3 + 0
-            node = $9; ip = $10
-            size = $8 + 0  # Force la conversion en nombre (0 si vide)
-            size_gb = (size > 0) ? sprintf("%.2f", size/1024/1024/1024) : "0.00"
 
-            # Déterminer priority et details en fonction du tag
-            if (tag == "RISK") {
-                priority = 1
-                details = "Copie unique - perte si " node " tombe"
-            } else if (tag == "SAFE") {
-                priority = 4
-                details = copies_started " copies STARTED - safe"
-            } else if (tag == "REPLICATING") {
-                priority = 3
-                details = "Réplication en cours - " copies_init " copies INITIALIZING"
-            } else if (tag == "UNASSIGNED") {
-                priority = 2
-                details = "Non assigné - à classifier (étape 5)"
-            } else if (tag == "NO_REPLICA") {
-                priority = 4
-                details = "ISM rep=0 - normal, non bloquant"
+    # Shards RISK/SAFE/REPLICATING/NO_REPLICA de l etape 4
+    if [ -s "$RISK_FILE" ]; then
+        awk -F'|' '
+            {
+                tag = $1; idx = $4; shard = $5; role = $6; state = $7
+                copies_started = $2 + 0; copies_init = $3 + 0
+                node = $9; ip = $10
+                size = $8 + 0  # Force la conversion en nombre (0 si vide)
+                size_gb = (size > 0) ? sprintf("%.2f", size/1024/1024/1024) : "0.00"
+
+                # Déterminer priority et details en fonction du tag
+                if (tag == "RISK") {
+                    priority = 1
+                    details = "Copie unique - perte si " node " tombe"
+                } else if (tag == "SAFE") {
+                    priority = 4
+                    details = copies_started " copies STARTED - safe"
+                } else if (tag == "REPLICATING") {
+                    priority = 3
+                    details = "Réplication en cours - " copies_init " copies INITIALIZING"
+                } else if (tag == "UNASSIGNED") {
+                    priority = 2
+                    details = "Non assigné - à classifier (étape 5)"
+                } else if (tag == "NO_REPLICA") {
+                    priority = 4
+                    details = "ISM rep=0 - normal, non bloquant"
+                } else {
+                    priority = 4
+                    details = "Statut inconnu"
+                }
+
+                printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n",
+                    idx, shard, role, tag, priority, state, copies_started, copies_init,
+                    node, ip, size_gb, details
             }
-
-            printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n",
-                idx, shard, role, tag, priority, state, copies_started, copies_init,
-                node, ip, size_gb, details
-        }
-    ' "$RISK_FILE"
+        ' "$RISK_FILE"
+    fi
 
     # Shards classifiés en etape 5 (ATTENTE_NOEUD, STALE, PERDU)
     if [ -s "$LOG_UNRECOVERABLE" ]; then
@@ -1069,7 +1080,14 @@ log "Generation de shard_summary.csv..."
         '
     fi
 } > "$LOG_SHARD_SUMMARY_CSV"
-log_ok "shard_summary.csv genere ($(wc -l < "$LOG_SHARD_SUMMARY_CSV" | tr -d ' ') shards)"
+
+# Vérifier que le CSV n'est pas vide (juste l'en-tête)
+SHARD_CSV_LINES=$(wc -l < "$LOG_SHARD_SUMMARY_CSV" | tr -d ' ')
+if [ "$SHARD_CSV_LINES" -eq 1 ]; then
+    log_warn "shard_summary.csv vide (aucune donnée disponible dans RISK_FILE ou LOG_UNRECOVERABLE)"
+else
+    log_ok "shard_summary.csv genere ($((SHARD_CSV_LINES - 1)) shards)"
+fi
 
 # ------------------------------------------------------------------------------
 # COMPTAGES PAR CATEGORIE (pour la synthese)
