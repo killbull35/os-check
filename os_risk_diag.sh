@@ -19,16 +19,44 @@ export LC_ALL=C
 export LANG=C
 
 # ------------------------------------------------------------------------------
-# Configuration par defaut
+# Charger la configuration depuis .env
 # ------------------------------------------------------------------------------
-OS_HOST="localhost:9200"
+ENV_FILE=".env"
+if [ -f "$ENV_FILE" ]; then
+    # Charger les variables d'environnement depuis le fichier .env
+    set -o allexport
+    source "$ENV_FILE"
+    set +o allexport
+else
+    echo "❌ Fichier $ENV_FILE introuvable !"
+    echo "   Veuillez créer un fichier .env avec au minimum :"
+    echo "   OS_HOST=<host>:<port>"
+    echo "   AUTH=-u <user>:<password>"
+    exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# Validation des variables obligatoires
+# ------------------------------------------------------------------------------
+if [ -z "$OS_HOST" ]; then
+    echo "❌ Variable OS_HOST non définie dans $ENV_FILE"
+    exit 1
+fi
+
+if [ -z "$AUTH" ]; then
+    echo "❌ Variable AUTH non définie dans $ENV_FILE"
+    exit 1
+fi
+
+# ------------------------------------------------------------------------------
+# Configuration par defaut (peut être écrasée par les arguments)
+# ------------------------------------------------------------------------------
 FILTER_TEMP=""
 FILTER_ZONE=""
 FORCE_REFRESH=""
 RESUME=""
 LOG_DIR_OVERRIDE=""
 CACHE_TTL=300         # secondes avant re-fetch (5 min)
-# AUTH="-u admin:motdepasse"
 # CURL_OPTS="-k"      # si TLS auto-signe
 
 # Initialiser les compteurs pour eviter les erreurs
@@ -123,7 +151,7 @@ CACHE_INDICES="$CACHE_DIR/indices.txt"
 mkdir -p "$CACHE_DIR"
 
 # Construction de la base curl
-CURL="curl -s --max-time 30 --retry 3 --retry-delay 2 ${AUTH} ${CURL_OPTS} http://${OS_HOST}/"
+CURL="curl -s --max-time 30 --retry 3 --retry-delay 2 ${AUTH} ${CURL_OPTS} https://${OS_HOST}/"
 
 # ------------------------------------------------------------------------------
 # Fonctions utilitaires
@@ -268,17 +296,8 @@ if [ "$LAST_CHECKPOINT" = "START" ]; then
         "$CACHE_NODES" \
         "noeuds" || { log_err "Abandon etape 1 - impossible de contacter $OS_HOST"; exit 1; }
 
-    awk '
-        BEGIN { RS=","; FS="\"" }
-        /"name"/ && !/attr/ {
-            if (name != "") print name "|" zone "|" temp
-            for(i=1;i<=NF;i++) if($i=="name") { name=$(i+2); break }
-            zone="-"; temp="-"
-        }
-        /"zone"/ { for(i=1;i<=NF;i++) if($i=="zone") { zone=$(i+2); break } }
-        /"temp"/ { for(i=1;i<=NF;i++) if($i=="temp") { temp=$(i+2); break } }
-        END      { if (name != "") print name "|" zone "|" temp }
-    ' "$CACHE_NODES" > "$CACHE_NODES_PARSED"
+    # Utiliser le script awk externe pour parser les nodes
+    awk -f "$(dirname "$0")/awk_scripts/parse_nodes.awk" "$CACHE_NODES" > "$CACHE_NODES_PARSED"
 
     if [ ! -s "$CACHE_NODES_PARSED" ]; then
         log_err "Aucun noeud parse. Verifiez node.attr.zone / node.attr.temp dans opensearch.yml"
@@ -291,7 +310,7 @@ if [ "$LAST_CHECKPOINT" = "START" ]; then
     {
         printf "%-30s %-10s %s\n" "NOM" "TEMP" "ZONE"
         printf '%s\n' "----------------------------------------------------"
-        awk -F'|' '{printf "%-30s %-10s %s\n", $1, $3, $2}' "$CACHE_NODES_PARSED"
+        awk -f "$(dirname "$0")/awk_scripts/format_nodes.awk" "$CACHE_NODES_PARSED"
         echo ""
         echo "Total : $NODE_TOTAL noeud(s)"
     } | tee -a "$LOG_NODES" >> "$LOG_MAIN"
@@ -300,8 +319,8 @@ if [ "$LAST_CHECKPOINT" = "START" ]; then
     # DÉTECTION DES NŒUDS/ZONES HORS LIGNE
     # --------------------------------------------------------------------------
     # 1. Extraire toutes les zones et temp attendues
-    ALL_ZONES=$(awk -F'|' '{print $2}' "$CACHE_NODES_PARSED" | sort -u | tr '\n' ' ')
-    ALL_TEMPS=$(awk -F'|' '{print $3}' "$CACHE_NODES_PARSED" | sort -u | tr '\n' ' ')
+    ALL_ZONES=$(awk -f "$(dirname "$0")/awk_scripts/extract_zones_temps.awk" -v field=2 "$CACHE_NODES_PARSED" | sort -u | tr '\n' ' ')
+    ALL_TEMPS=$(awk -f "$(dirname "$0")/awk_scripts/extract_zones_temps.awk" -v field=3 "$CACHE_NODES_PARSED" | sort -u | tr '\n' ' ')
 
     # 2. Compter le nombre de nœuds par zone/temp
     declare -A ZONE_COUNT
@@ -359,16 +378,11 @@ if [ "$LAST_CHECKPOINT" = "NODES_DONE" ]; then
     section "$LOG_NODES" "ETAPE 2/5 - Filtrage des noeuds cibles"
     checkpoint_set "FILTER_RUNNING"
 
-    awk -F'|' \
+    # Utiliser le script awk externe pour filtrer les nodes
+    awk -f "$(dirname "$0")/awk_scripts/filter_nodes.awk" \
         -v ft="$FILTER_TEMP" \
         -v fz="$FILTER_ZONE" \
-        '{
-            name=$1; zone=$2; temp=$3
-            if (ft != "" && temp != ft) next
-            if (fz != "" && zone != fz) next
-            print name
-        }
-    ' "$CACHE_NODES_PARSED" > "$TARGET_NODES_FILE"
+        "$CACHE_NODES_PARSED" > "$TARGET_NODES_FILE"
 
     # Ajouter les nœuds hors ligne à la liste des cibles
     if [ -n "$OFFLINE_NODES" ]; then
@@ -426,7 +440,7 @@ if [ "$LAST_CHECKPOINT" = "FILTER_DONE" ]; then
     # Construire rep_flat.txt pour exclure les replicas ISM (rep=0)
     CACHE_REP="$CACHE_DIR/rep_flat.txt"
     if [ -s "$CACHE_INDICES" ]; then
-        awk '{print $1 "|" $3}' "$CACHE_INDICES" > "$CACHE_REP"
+        awk -f "$(dirname "$0")/awk_scripts/build_rep_flat.awk" "$CACHE_INDICES" > "$CACHE_REP"
         log_ok "rep_flat construit ($(wc -l < "$CACHE_REP" | tr -d ' ') index) — ISM rep=0 sera exclu du RISK"
     else
         log_warn "CACHE_INDICES absent — shards ISM rep=0 non filtres a l etape 4"
@@ -514,63 +528,15 @@ if [ "$LAST_CHECKPOINT" = "SHARDS_DONE" ]; then
     rm -f /tmp/shard_started.$ /tmp/shard_init.$
 
     # Stats par noeud cible
-    awk -v tfile="$TARGET_NODES_FILE" '
-        BEGIN {
-            while ((getline node < tfile) > 0) targets[node]=1
-        }
-        $4=="STARTED" && ($6 in targets) {
-            count[$6]++
-            size[$6] += $5
-        }
-        $4=="INITIALIZING" && ($6 in targets) {
-            init_count[$6]++
-        }
-        $4!="STARTED" && $4!="INITIALIZING" && ($6 in targets) {
-            other[$6]++
-        }
-        END {
-            for (n in count)
-                printf "%s|%s|%.2f|%s|%s\n",
-                    n, count[n], size[n]/1024/1024/1024,
-                    (init_count[n]+0), (other[n]+0)
-        }
-    ' "$CACHE_SHARDS" > "$NODE_STATS_FILE"
+    awk -f "$(dirname "$0")/awk_scripts/node_stats.awk" -v tfile="$TARGET_NODES_FILE" "$CACHE_SHARDS" > "$NODE_STATS_FILE"
 
     # Volumetrie totale par index concerne
-    awk -v tfile="$TARGET_NODES_FILE" '
-        BEGIN {
-            while ((getline node < tfile) > 0) targets[node]=1
-        }
-        $4=="STARTED" && ($6 in targets) { concerned[$1] = 1 }
-        END { for (idx in concerned) print idx }
-    ' "$CACHE_SHARDS" > "$CACHE_DIR/concerned_indexes.txt"
+    awk -f "$(dirname "$0")/awk_scripts/concerned_indexes.awk" -v tfile="$TARGET_NODES_FILE" "$CACHE_SHARDS" > "$CACHE_DIR/concerned_indexes.txt"
 
     if [ -s "$CACHE_INDICES" ]; then
-        awk -v cfile="$CACHE_DIR/concerned_indexes.txt" '
-            BEGIN {
-                while ((getline idx < cfile) > 0) concerned[idx] = 1
-            }
-            ($1 in concerned) {
-                printf "%s|%s|%s|%s|%s|%s\n", $1, $2, $3, $4, $5, $6
-            }
-        ' "$CACHE_INDICES" > "$INDEX_VOL_FILE"
+        awk -f "$(dirname "$0")/awk_scripts/filter_concerned_indices.awk" -v cfile="$CACHE_DIR/concerned_indexes.txt" "$CACHE_INDICES" > "$INDEX_VOL_FILE"
     else
-        awk -v tfile="$TARGET_NODES_FILE" '
-            BEGIN {
-                while ((getline node < tfile) > 0) targets[node]=1
-            }
-            $4=="STARTED" && ($6 in targets) { concerned[$1] = 1 }
-            $4=="STARTED" && ($1 in concerned) {
-                total_size[$1] += $5
-                total_shards[$1]++
-                if ($3 == "p") pri_size[$1] += $5
-            }
-            END {
-                for (idx in concerned)
-                    printf "%s|-|-|-|%.0f|%.0f\n",
-                        idx, total_size[idx], pri_size[idx]
-            }
-        ' "$CACHE_SHARDS" > "$INDEX_VOL_FILE"
+        awk -f "$(dirname "$0")/awk_scripts/volumetrie_fallback.awk" -v tfile="$TARGET_NODES_FILE" "$CACHE_SHARDS" > "$INDEX_VOL_FILE"
     fi
 
     checkpoint_set "ANALYSIS_DONE"
@@ -630,7 +596,7 @@ else
 
     # Construire rep_flat.txt depuis le cache _cat/indices
     if [ ! -s "$CACHE_REP" ] && [ -s "$CACHE_INDICES" ]; then
-        awk '{print $1 "|" $3}' "$CACHE_INDICES" > "$CACHE_REP"
+        awk -f "$(dirname "$0")/awk_scripts/build_rep_flat.awk" "$CACHE_INDICES" > "$CACHE_REP"
         log "rep_flat.txt construit depuis cache indices ($(wc -l < "$CACHE_REP" | tr -d ' ') index)"
     elif [ ! -s "$CACHE_REP" ]; then
         log_warn "CACHE_INDICES absent — nombre de replicas non disponible (ISM non detecte)"
@@ -638,11 +604,12 @@ else
     fi
 
     # Liste CSV des index uniques ayant des shards UNASSIGNED
+    # Extraire uniquement le premier mot du 4ème champ (au cas où il contient des espaces)
     INDEX_CSV=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
-        | awk -F'|' '{print $4}' | sort -u | tr '\n' ',' | sed 's/,$//')
+        | awk -f "$(dirname "$0")/awk_scripts/extract_index_names.awk" | sort -u | tr '\n' ',' | sed 's/,$//')
 
     INDEX_COUNT=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
-        | awk -F'|' '{print $4}' | sort -u | wc -l | tr -d ' ')
+        | awk -f "$(dirname "$0")/awk_scripts/extract_index_names.awk" | sort -u | wc -l | tr -d ' ')
 
     log "Fetch cluster state (metadata+routing_table) — $INDEX_COUNT index en un seul appel"
 
@@ -672,82 +639,9 @@ else
 
         log "Parsing cluster state (un seul awk POSIX)..."
 
-        awk '
-            # ---- Detection du contexte index ---
-            /"indices"/ { in_indices_meta = 1 }
-
-            in_indices_meta && /^ *"[^"]+": *\{/ {
-                tmp = $0
-                gsub(/^ *"/, "", tmp); gsub(/".*/, "", tmp)
-                if (tmp !~ /^(mappings|settings|aliases|in_sync_allocations|routing_table|shards|indices)$/ \
-                    && length(tmp) > 0)
-                    current_meta_idx = tmp
-            }
-
-            # ---- in_sync_allocations ---
-            /"in_sync_allocations"/ { in_insync = 1; next }
-
-            in_insync && /^ *"[0-9]+"/ {
-                tmp = $0
-                gsub(/^ *"/, "", tmp)
-                gsub(/".*/, "", tmp)
-                insync_shard = tmp
-            }
-
-            in_insync && insync_shard != "" && /\[/ {
-                tmp = $0
-                gsub(/.*\[/, "", tmp); gsub(/\].*/, "", tmp)
-                gsub(/"/, "", tmp);    gsub(/ /, "", tmp)
-                gsub(/^,/, "", tmp);   gsub(/,$/, "", tmp)
-                if (tmp != "")
-                    print current_meta_idx "|" insync_shard "|" tmp > insync_out
-                insync_shard = ""
-            }
-            in_insync && /^\s*\},?\s*$/ && insync_shard == "" { in_insync = 0 }
-
-            # ---- routing_table ---
-            /"routing_table"/ { in_routing = 1; in_indices_meta = 0 }
-
-            in_routing && /^ *"[^"]+": *\{/ {
-                tmp = $0
-                gsub(/^ *"/, "", tmp); gsub(/".*/, "", tmp)
-                if (tmp !~ /^(shards|routing_table|indices)$/ && length(tmp) > 0)
-                    current_rt_idx = tmp
-            }
-
-            in_routing && /"shard" *:/ {
-                tmp = $0
-                gsub(/.*"shard" *: */, "", tmp)
-                gsub(/[^0-9].*/, "", tmp)
-                rt_shard = tmp
-                rt_state = ""
-                rt_alloc = "NONE"
-                rt_primary = ""
-                rt_node = ""
-            }
-
-            in_routing && /"primary" *: *true/    { rt_primary = "true" }
-            in_routing && /"state" *: *"UNASSIGNED"/ { rt_state = "UNASSIGNED" }
-            in_routing && /"node" *: *"[^"]+"/ {
-                tmp = $0
-                gsub(/.*"node" *: *"/, "", tmp)
-                gsub(/".*/, "", tmp)
-                rt_node = tmp
-            }
-
-            in_routing && rt_shard != "" && /"id" *: *"/ {
-                tmp = $0
-                gsub(/.*"id" *: *"/, "", tmp)
-                gsub(/".*/, "", tmp)
-                if (tmp != "") rt_alloc = tmp
-            }
-
-            in_routing && /^\s*\},?\s*$/ && rt_primary == "true" && rt_state == "UNASSIGNED" {
-                print current_rt_idx "|" rt_shard "|" rt_alloc "|" rt_node > routing_out
-                rt_primary = ""; rt_state = ""; rt_alloc = "NONE"; rt_shard = ""; rt_node = ""
-            }
-
-        ' insync_out="$CACHE_INSYNC" routing_out="$CACHE_ROUTING" "$CACHE_STATE_ALL"
+        # Utiliser le script awk externe pour parser le cluster state
+        awk -f "$(dirname "$0")/awk_scripts/parse_cluster_state.awk" \
+            insync_out="$CACHE_INSYNC" routing_out="$CACHE_ROUTING" "$CACHE_STATE_ALL"
 
         log_ok "Parsing termine — insync: $(wc -l < "$CACHE_INSYNC" | tr -d ' ') entrees, routing: $(wc -l < "$CACHE_ROUTING" | tr -d ' ') entrees"
     else
@@ -1144,7 +1038,7 @@ fi
 if [ "${COUNT_PERDU:-0}" -gt 0 ]; then
     echo " 🔴 PERTE DE DONNÉES DÉTECTÉE"
     echo "   $COUNT_PERDU shard(s) PERDU → Aucune copie valide connue"
-    PERDU_VOLUME=$(awk -F'|' '/PERDU/ {sum+=$8} END {printf "%.2f GB", sum/1024/1024/1024}' "$LOG_UNRECOVERABLE" 2>/dev/null || echo "?")
+    PERDU_VOLUME=$(awk -f "$(dirname "$0")/awk_scripts/calc_volume.awk" -v status="PERDU" "$LOG_UNRECOVERABLE" 2>/dev/null || echo "?")
     echo "   Volume perdu : $PERDU_VOLUME"
     echo "   Index concernés :"
     grep "|PERDU" "$LOG_UNRECOVERABLE" | awk '{print "     - " $1}' | sort -u
@@ -1159,7 +1053,7 @@ fi
 if [ "${COUNT_STALE:-0}" -gt 0 ]; then
     echo " ⚠️  RÉCUPÉRATION NÉCESSAIRE (STALE)"
     echo "   $COUNT_STALE shard(s) STALE → Copie périmée sur disque"
-    STALE_VOLUME=$(awk -F'|' '/STALE/ {sum+=$8} END {printf "%.2f GB", sum/1024/1024/1024}' "$LOG_UNRECOVERABLE" 2>/dev/null || echo "?")
+    STALE_VOLUME=$(awk -f "$(dirname "$0")/awk_scripts/calc_volume.awk" -v status="STALE" "$LOG_UNRECOVERABLE" 2>/dev/null || echo "?")
     echo "   Volume concerné : $STALE_VOLUME"
     echo "   Actions :"
     echo "     - Exécuter les commandes dans remediation.log (allocate_stale_primary)"
@@ -1170,7 +1064,7 @@ fi
 if [ "${COUNT_ATTENTE:-0}" -gt 0 ]; then
     echo " ℹ️  RÉCUPÉRATION AUTOMATIQUE (ATTENTE_NOEUD)"
     echo "   $COUNT_ATTENTE shard(s) ATTENTE_NOEUD → Recovery auto au retour des nœuds"
-    ATTENTE_VOLUME=$(awk -F'|' '/ATTENTE/ {sum+=$8} END {printf "%.2f GB", sum/1024/1024/1024}' "$LOG_UNRECOVERABLE" 2>/dev/null || echo "?")
+    ATTENTE_VOLUME=$(awk -f "$(dirname "$0")/awk_scripts/calc_volume.awk" -v status="ATTENTE" "$LOG_UNRECOVERABLE" 2>/dev/null || echo "?")
     echo "   Volume concerné : $ATTENTE_VOLUME"
     echo "   Actions :"
     echo "     - Redémarrer les nœuds hors ligne pour recovery automatique"
@@ -1201,7 +1095,7 @@ fi
 # --- Synthèse Globale ---
 echo " ✅ SYNTHÈSE GLOBALE"
 echo "   - Total shards analysés : $SHARD_TOTAL"
-TOTAL_VOL=$(awk -F'|' '{sum+=$5} END {printf "%.2f GB", sum/1024/1024/1024}' "$CACHE_SHARDS" 2>/dev/null || echo "?")
+TOTAL_VOL=$(awk -f "$(dirname "$0")/awk_scripts/total_volume.awk" "$CACHE_SHARDS" 2>/dev/null || echo "?")
 echo "   - Volume total concerné : $TOTAL_VOL"
 echo "   - Nœuds en ligne : $NODE_TOTAL"
 [ -n "$OFFLINE_NODES" ] && echo "   - Nœuds hors ligne : $OFFLINE_NODES"
