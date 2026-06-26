@@ -21,14 +21,33 @@ export LANG=C
 # ------------------------------------------------------------------------------
 # Configuration par defaut
 # ------------------------------------------------------------------------------
-OS_HOST="localhost:9200"
+# Charger la configuration depuis .env si present
+ENV_FILE=".env"
+if [ -f "$ENV_FILE" ]; then
+    set -o allexport
+    source "$ENV_FILE"
+    set +o allexport
+else
+    echo "❌ Fichier $ENV_FILE introuvable !"
+    exit 1
+fi
+
+# Validation des variables obligatoires
+if [ -z "$OS_HOST" ]; then 
+    echo "❌ Variable OS_HOST non définie"
+    exit 1
+fi
+if [ -z "$AUTH" ]; then 
+    echo "❌ Variable AUTH non définie"
+    exit 1
+fi
+
 FILTER_TEMP=""
 FILTER_ZONE=""
 FORCE_REFRESH=""
 RESUME=""
 LOG_DIR_OVERRIDE=""
-CACHE_TTL=300         # secondes avant re-fetch (5 min)
-# AUTH="-u admin:motdepasse"
+CACHE_TTL=${CACHE_TTL:-300}         # secondes avant re-fetch (5 min)
 # CURL_OPTS="-k"      # si TLS auto-signe
 
 # Initialiser les compteurs pour eviter les erreurs
@@ -123,7 +142,7 @@ CACHE_INDICES="$CACHE_DIR/indices.txt"
 mkdir -p "$CACHE_DIR"
 
 # Construction de la base curl
-CURL="curl -s --max-time 30 --retry 3 --retry-delay 2 ${AUTH} ${CURL_OPTS} http://${OS_HOST}/"
+CURL="curl -s --max-time 30 --retry 3 --retry-delay 2 ${AUTH} ${CURL_OPTS} https://${OS_HOST}/"
 
 # ------------------------------------------------------------------------------
 # Fonctions utilitaires
@@ -639,10 +658,10 @@ else
 
     # Liste CSV des index uniques ayant des shards UNASSIGNED
     INDEX_CSV=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
-        | awk -F'|' '{print $4}' | sort -u | tr '\n' ',' | sed 's/,$//')
+        | awk -F'|' '{split($4, idx_parts, " "); print idx_parts[1]}' | sort -u | tr '\n' ',' | sed 's/,$//')
 
     INDEX_COUNT=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
-        | awk -F'|' '{print $4}' | sort -u | wc -l | tr -d ' ')
+        | awk -F'|' '{split($4, idx_parts, " "); print idx_parts[1]}' | sort -u | wc -l | tr -d ' ')
 
     log "Fetch cluster state (metadata+routing_table) — $INDEX_COUNT index en un seul appel"
 
@@ -672,82 +691,10 @@ else
 
         log "Parsing cluster state (un seul awk POSIX)..."
 
-        awk '
-            # ---- Detection du contexte index ---
-            /"indices"/ { in_indices_meta = 1 }
-
-            in_indices_meta && /^ *"[^"]+": *\{/ {
-                tmp = $0
-                gsub(/^ *"/, "", tmp); gsub(/".*/, "", tmp)
-                if (tmp !~ /^(mappings|settings|aliases|in_sync_allocations|routing_table|shards|indices)$/ \
-                    && length(tmp) > 0)
-                    current_meta_idx = tmp
-            }
-
-            # ---- in_sync_allocations ---
-            /"in_sync_allocations"/ { in_insync = 1; next }
-
-            in_insync && /^ *"[0-9]+"/ {
-                tmp = $0
-                gsub(/^ *"/, "", tmp)
-                gsub(/".*/, "", tmp)
-                insync_shard = tmp
-            }
-
-            in_insync && insync_shard != "" && /\[/ {
-                tmp = $0
-                gsub(/.*\[/, "", tmp); gsub(/\].*/, "", tmp)
-                gsub(/"/, "", tmp);    gsub(/ /, "", tmp)
-                gsub(/^,/, "", tmp);   gsub(/,$/, "", tmp)
-                if (tmp != "")
-                    print current_meta_idx "|" insync_shard "|" tmp > insync_out
-                insync_shard = ""
-            }
-            in_insync && /^\s*\},?\s*$/ && insync_shard == "" { in_insync = 0 }
-
-            # ---- routing_table ---
-            /"routing_table"/ { in_routing = 1; in_indices_meta = 0 }
-
-            in_routing && /^ *"[^"]+": *\{/ {
-                tmp = $0
-                gsub(/^ *"/, "", tmp); gsub(/".*/, "", tmp)
-                if (tmp !~ /^(shards|routing_table|indices)$/ && length(tmp) > 0)
-                    current_rt_idx = tmp
-            }
-
-            in_routing && /"shard" *:/ {
-                tmp = $0
-                gsub(/.*"shard" *: */, "", tmp)
-                gsub(/[^0-9].*/, "", tmp)
-                rt_shard = tmp
-                rt_state = ""
-                rt_alloc = "NONE"
-                rt_primary = ""
-                rt_node = ""
-            }
-
-            in_routing && /"primary" *: *true/    { rt_primary = "true" }
-            in_routing && /"state" *: *"UNASSIGNED"/ { rt_state = "UNASSIGNED" }
-            in_routing && /"node" *: *"[^"]+"/ {
-                tmp = $0
-                gsub(/.*"node" *: *"/, "", tmp)
-                gsub(/".*/, "", tmp)
-                rt_node = tmp
-            }
-
-            in_routing && rt_shard != "" && /"id" *: *"/ {
-                tmp = $0
-                gsub(/.*"id" *: *"/, "", tmp)
-                gsub(/".*/, "", tmp)
-                if (tmp != "") rt_alloc = tmp
-            }
-
-            in_routing && /^\s*\},?\s*$/ && rt_primary == "true" && rt_state == "UNASSIGNED" {
-                print current_rt_idx "|" rt_shard "|" rt_alloc "|" rt_node > routing_out
-                rt_primary = ""; rt_state = ""; rt_alloc = "NONE"; rt_shard = ""; rt_node = ""
-            }
-
-        ' insync_out="$CACHE_INSYNC" routing_out="$CACHE_ROUTING" "$CACHE_STATE_ALL"
+        awk -f "awk_scripts/parse_cluster_state.awk" \
+            -v insync_out="$CACHE_INSYNC" \
+            -v routing_out="$CACHE_ROUTING" \
+            "$CACHE_STATE_ALL"
 
         log_ok "Parsing termine — insync: $(wc -l < "$CACHE_INSYNC" | tr -d ' ') entrees, routing: $(wc -l < "$CACHE_ROUTING" | tr -d ' ') entrees"
     else
@@ -1182,7 +1129,7 @@ if [ "$RISK_COUNT" -gt 0 ]; then
     echo " 🔴 SHARDS EN COPIE UNIQUE (RISK)"
     echo "   $RISK_COUNT shard(s) en copie unique → Perte de données si nœud tombe"
     echo "   Index concernés :"
-    grep "^RISK|" "$RISK_FILE" | awk -F'|' '{print "     - " $4}' | sort -u
+    grep "^RISK|" "$RISK_FILE" | awk -F'|' '{split($4, idx_parts, " "); print "     - " idx_parts[1]}' | sort -u
     echo "   Actions :"
     echo "     - Augmenter number_of_replicas sur les index concernés"
     echo "     - Attendre la réplication : GET /_cluster/health?wait_for_status=green"
