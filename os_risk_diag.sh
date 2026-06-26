@@ -638,11 +638,12 @@ else
     fi
 
     # Liste CSV des index uniques ayant des shards UNASSIGNED
+    # Extraire uniquement le premier mot du 4ème champ (au cas où il contient des espaces)
     INDEX_CSV=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
-        | awk -F'|' '{print $4}' | sort -u | tr '\n' ',' | sed 's/,$//')
+        | awk -F'|' '{split($4, idx_parts, " "); print idx_parts[1]}' | sort -u | tr '\n' ',' | sed 's/,$//')
 
     INDEX_COUNT=$(echo "$UNASSIGNED_FROM_ANALYSIS" \
-        | awk -F'|' '{print $4}' | sort -u | wc -l | tr -d ' ')
+        | awk -F'|' '{split($4, idx_parts, " "); print idx_parts[1]}' | sort -u | wc -l | tr -d ' ')
 
     log "Fetch cluster state (metadata+routing_table) — $INDEX_COUNT index en un seul appel"
 
@@ -809,7 +810,9 @@ else
 
         # Colonnes UNASSIGNED_FROM_ANALYSIS : tag|started|init|index|shard|role|state|store|node|ip
         $1 == "UNASSIGNED" {
-            idx = $4; shard = $5; role = $6; store = $8
+            # Extraire uniquement le premier mot du champ index (au cas où il contient des espaces)
+            split($4, idx_parts, " "); idx = idx_parts[1]
+            shard = $5; role = $6; store = $8
             key = idx "|" shard
             size_gb = sprintf("%.2f", (store + 0) / 1024 / 1024 / 1024)
 
@@ -973,7 +976,9 @@ if [ -s "$INDEX_VOL_FILE" ]; then
                 # Charger les compteurs par index depuis RISK_FILE
                 while ((getline line < risk_file) > 0) {
                     split(line, f, "|")
-                    tag = f[1]; idx = f[4]
+                    tag = f[1]
+                    # Extraire uniquement le premier mot du champ index
+                    split(f[4], idx_parts, " "); idx = idx_parts[1]
                     if (tag == "RISK")        risk[idx]++
                     if (tag == "REPLICATING") replic[idx]++
                     if (tag == "UNASSIGNED")  unassign[idx]++
@@ -1035,7 +1040,7 @@ log "Generation de shard_summary.csv..."
     if [ -s "$RISK_FILE" ]; then
         awk -F'|' '
             {
-                tag = $1; idx = $4; shard = $5; role = $6; state = $7
+                tag = $1; split($4, idx_parts, " "); idx = idx_parts[1]; shard = $5; role = $6; state = $7
                 copies_started = $2 + 0; copies_init = $3 + 0
                 node = $9; ip = $10
                 size = $8 + 0  # Force la conversion en nombre (0 si vide)
